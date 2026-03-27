@@ -18,21 +18,49 @@
 
 import os, sys, json, subprocess, time, math, re, argparse
 
-# Import smart tap helper
-try:
-    import tap_helper as _tap_helper
-    _SMART_TAP = True
-except ImportError:
-    _SMART_TAP = False
+# --- PATH DATA -----------------------------------------------
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE    = os.path.join(BASE_DIR, "activity.log")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+# -------------------------------------------------------------
 
-def _tap_helper_fallback(pkg, x1, y1, x2, y2):
-    """Fallback tap tanpa tap_helper."""
+# Global shared data for Bot (so it doesn't use status.json)
+# Using a list of dicts that Bot can read directly if imported.
+MONITOR_DATA = []
+BOT_COMMAND  = None # To replace .bot_cmd file
+
+# --- BRING TO FOREGROUND ---------------------------------------
+def bring_to_foreground(pkg):
+    """
+    Bawa window Roblox ke foreground secara pasif.
+    Cek dulu apa sudah di depan, biar gak ganggu executor.
+    """
+    try:
+        # Cek apakah package target sudah ada di foreground (Resume Activity)
+        ok, out = run_root("dumpsys activity top 2>/dev/null | grep mResumedActivity")
+        if ok and pkg in out:
+            return True # Sudah di depan, jangan am start lagi (cegah crash)
+            
+        # Jika belum, baru panggil am start
+        run_root(f"am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n {pkg}/com.roblox.client.ActivityProtocolLaunch 2>/dev/null; true")
+        time.sleep(0.3)
+        return True
+    except:
+        return False
+
+def smart_tap_burst(pkg, x1, y1, x2, y2):
+    """Tap burst 3x di tengah window Roblox. Bawa ke foreground dulu."""
     cx = (x1 + x2) // 2
-    run_root(f"am start -a android.intent.action.MAIN -n {pkg}/com.roblox.client.ActivityProtocolLaunch 2>/dev/null; true")
-    time.sleep(0.2)
-    for ty in [(y1+y2)//2, y1+int((y2-y1)*0.70), y1+int((y2-y1)*0.85)]:
-        run_root(f"input tap {cx} {ty}")
-        time.sleep(0.08)
+    cy = (y1 + y2) // 2
+
+    # bring_to_foreground(pkg)  # TEST: Deactivated to stop crashes on some executors
+    time.sleep(0.3) # Tunggu focus mantap
+
+    # Burst tap 3x Center
+    for _ in range(3):
+        run_root(f"input tap {cx} {cy}")
+        time.sleep(0.04)
+    return cx, cy, "burst-center"
 
 # --- ARGS --------------------------------------------------
 parser = argparse.ArgumentParser()
@@ -42,11 +70,7 @@ parser.add_argument("--low",       action="store_true")
 parser.add_argument("--packages",  help="Filter: package1,package2,...")
 ARGS = parser.parse_args()
 
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-LOG_FILE    = os.path.join(BASE_DIR, "activity.log")
-STATUS_FILE = os.path.join(BASE_DIR, "status.json")
-CMD_FILE    = os.path.join(BASE_DIR, ".bot_cmd")   # File perintah dari bot
+PID_FILE    = os.path.join(BASE_DIR, "rejoin.pid")
 
 # --- WARNA -------------------------------------------------
 R  = "\033[0m"
@@ -73,8 +97,13 @@ def reset_terminal():
     sys.stdout.flush()
 
 def clear():
-    """Simpler and more stable clear for Termux."""
+    """Clear screen total (hanya panggil saat ganti menu)."""
     sys.stdout.write("\033[H\033[2J")
+    sys.stdout.flush()
+
+def move_home():
+    """Pindah kursor ke (1,1) tanpa hapus layar (cegah flicker)."""
+    sys.stdout.write("\033[H")
     sys.stdout.flush()
 
 def run_root(cmd, timeout=15):
@@ -87,11 +116,16 @@ def run_root(cmd, timeout=15):
         return False, str(e)
 
 def log(msg, lvl="INFO"):
+    formatted = f"[{time.strftime('%d/%m %H:%M:%S')}][{lvl}] {msg}"
     try:
         with open(LOG_FILE, "a") as f:
-            f.write(f"[{time.strftime('%d/%m %H:%M:%S')}][{lvl}] {msg}\n")
+            f.write(formatted + "\n")
     except:
         pass
+    # Print to console only if it's a real terminal (Termux) AND not DEBUG
+    if sys.stdout.isatty() and lvl != "DEBUG":
+        sys.stdout.write(formatted + "\n")
+        sys.stdout.flush()
 
 def _open_tty():
     return None
@@ -194,6 +228,7 @@ def load_cfg():
         "auto_mute": True,
         "auto_low_graphics": True,
         "auto_tap_splash": True,
+        "load_delay": 40,
         "webhook_url": "",
     }
 
@@ -327,12 +362,18 @@ def check_user_presence(uid, cookie):
                     cookies={".ROBLOSECURITY": cookie},
                     headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
         if r.status_code == 200 and r.json().get('userPresences'):
-            p = r.json()['userPresences'][0]
-            # Type 2 = In-Game, Type 1 = Online (Lobby/Menu)
-            # 0=Offline, 1=Online, 2=InGame, 3=Studio, 4=Basic
+            resp_json = r.json()
+            p = resp_json['userPresences'][0]
             st_type  = p.get('userPresenceType', 0)
             place_id = p.get('placeId')
-            game_id  = p.get('gameId') # Job ID Instance
+            game_id  = p.get('gameId')
+            
+            # Detailed Logging: Show full API response as requested by user
+            st_labels = {0: "Offline", 1: "Lobby", 2: "InGame", 3: "Studio", 4: "Basic"}
+            label = st_labels.get(st_type, "Unknown")
+            log(f"Presence API Full Result: {resp_json}", "DEBUG")
+            log(f"Presence API: Type={st_type}({label}) Place={place_id} ID={str(game_id)[:8]}...", "DEBUG")
+            
             return (st_type == 2), place_id, st_type, game_id
     except: pass
     return False, None, 0, None # Fallback: Assume NOT in-game on API error
@@ -347,10 +388,18 @@ def get_pid(pkg):
 #  NETWORK CHECK (standalone wrapper)
 # ==========================================================
 def has_active_connection(pkg):
-    """Cek network via simple shell command."""
-    ok, out = run_root(f"cat /proc/net/tcp 2>/dev/null | grep -i {pkg} || true")
-    return ok and pkg in out
-    return connected
+    """Cek network via package UID untuk deteksi ghost session."""
+    try:
+        # Dapatkan UID package
+        ok, out = run_root(f"ls -ld /data/data/{pkg} 2>/dev/null | awk '{{print $3}}'")
+        if not ok or not out.strip(): return False
+        uid = out.strip()
+        
+        # Cek koneksi TCP aktif untuk UID tersebut
+        ok2, out2 = run_root(f"cat /proc/net/tcp 2>/dev/null | grep -i ' {uid} ' || cat /proc/net/tcp6 2>/dev/null | grep -i ' {uid} '")
+        return ok2 and len(out2.strip()) > 0
+    except:
+        return False
 
 # ==========================================================
 #  FREEZE DETECTION via CPU
@@ -620,7 +669,17 @@ def print_banner():
 #  DRAW UI MONITORING
 # ==========================================================
 def draw_ui(accounts, sys_status, prog="", nxt_wh=""):
-    clear()
+    if not sys.stdout.isatty():
+        return # Skip UI drawing if stdout is not a terminal
+
+    # Gunakan move_home() biar dia overwrite Buffer lama, bukan clear -> write (flicker)
+    move_home()
+    
+    # Map NL→CR+NL agar bare \n rapi di Termux
+    try: os.system("stty onlcr 2>/dev/null")
+    except: pass
+
+    # Hitung RAM di tengah biar dapet stats fresh
     mem, mpct = get_memory()
 
     try:
@@ -629,8 +688,10 @@ def draw_ui(accounts, sys_status, prog="", nxt_wh=""):
     except:
         W = int(os.environ.get("COLUMNS", 44))
     W = max(28, W - 1)
-    sep  = "=" * W
-    sep2 = "-" * W
+
+    NL  = "\r\n"
+    div = f"{CY}{'='*W}{R}"
+    sep = f"{CY}{'-'*W}{R}"
 
     def trunc(s, n):
         s = str(s).replace('\n','').replace('\r','')
@@ -652,41 +713,67 @@ def draw_ui(accounts, sys_status, prog="", nxt_wh=""):
         "presence-api": "[API]",
     }
 
-    # Header
-    sys.stdout.write(f"{CY}{sep}{R}\n")
-    sys.stdout.write(f"{MG} YURXZ Rejoin v9  |  by YURXZ{R}\n")
-    sys.stdout.write(f"{CY}{sep2}{R}\n")
-    sys.stdout.write(f"{YE} {trunc(st_txt, W-2)}{R}\n")
-    sys.stdout.write(f"{GY} RAM: {mem} ({mpct}%){R}\n")
+    # ── Header ────────────────────────────────────────────
+    out  = div + NL
+    out += trunc(f"{MG}YURXZ Rejoin v9  |  by YURXZ{R}", W) + NL
+    out += sep + NL
+    out += f"{YE}{trunc(st_txt, W)}{R}" + NL
+    out += f"{GY}RAM: {mem} ({mpct}%){R}" + NL
     if mode:
-        sys.stdout.write(f"{GY} Mode: {' | '.join(mode)}{R}\n")
-    sys.stdout.write(f"{CY}{sep2}{R}\n")
+        out += f"{GY}Mode: {' | '.join(mode)}{R}" + NL
+    out += sep + NL
 
-    # Package list — portrait: tiap package 2 baris
+    # ── Package rows ──────────────────────────────────────
     for a in accounts:
         st  = a.get("status", "?")
         mtd = a.get("method", "auto")
         lbl = mtd_labels.get(mtd, "[?]")
         col = GR
-        if any(x in st for x in ["Restart","Launch","Wait","Cache","Stop","Loading","Cek","Detect","Tap","Inject"]):
+        if any(x in st for x in ["Restart","Launch","Wait","Cache","Stop","Loading",
+                                  "Cek","Detect","Tap","Inject","Click","Burst"]):
             col = YE
         elif any(x in st for x in ["Error","Failed","Crash","Freeze","mati","putus","Offline"]):
             col = RE
         elif any(x in st for x in ["Idle","Pending"]):
             col = GY
-        pkg     = a.get('pkg', '?').replace('com.roblox.', 'rb.')
-        uname   = a.get('username', 'Unknown')
-        rejoin  = a.get('rejoin_count', 0)
-        sys.stdout.write(f"{CY} {lbl}{R} {WH}{pkg} {GY}({uname}){R}\n")
-        sys.stdout.write(f"    {col}{trunc(st, W-5)}{R} {GY}({rejoin}x){R}\n")
-        sys.stdout.write(f"{GY} {sep2}{R}\n")
 
-    sys.stdout.write(f"{CY}{sep}{R}\n")
-    sys.stdout.write(f"{GY} [q]=stop{R}\n")
+        pkg    = a.get('pkg', '?').replace('com.roblox.', 'rb.')
+        uname  = a.get('username', 'Unknown')
+        rejoin = a.get('rejoin_count', 0)
+
+        header      = f"{lbl} {pkg} ({uname})"
+        status_line = f"{trunc(st, W-6)} ({rejoin}x)"
+        out += f"{CY}{trunc(header, W)}{R}" + NL
+        out += f"{col}{status_line}{R}" + NL
+        out += sep + NL
+
+    # ── Footer ────────────────────────────────────────────
+    out += div + NL
+    out += f"{GY}[q]=stop{R}" + NL
+
+    # Gunakan satu kali write buffer + flush
+    sys.stdout.write(out + "\033[J") # [J untuk hapus sisa line lama
     sys.stdout.flush()
 
+    # --- Update global MONITOR_DATA for direct Bot access (No status.json needed) ---
+    try:
+        global MONITOR_DATA
+        MONITOR_DATA = [
+            {
+                "pkg":      a.get("pkg", "?"),
+                "status":   a.get("status", "?"),
+                "username": a.get("username", "Unknown"),
+                "rejoin":   a.get("rejoin_count", 0),
+                "method":   a.get("method", "auto")
+            } for a in accounts
+        ]
+    except:
+        pass
+
+
+
 # ==========================================================
-#  DETECTION HELPERS
+#  DETECTION HELPERS (FEATHERWEIGHT — No Libs)
 # ==========================================================
 def get_current_activity(pkg=None):
     """Ambil nama activity yang sedang fokus/top."""
@@ -710,29 +797,18 @@ def get_current_activity(pkg=None):
 def is_in_game(pkg, cookie_info=None):
     """
     Improved detection: Cross-verify API with actual Window status.
-    Ensure we aren't stuck on a 'Welcome' / 'Key' screen even if API says we are in-game.
     Return (bool, activity_name, method)
     """
-    # 1. ALWAYS check for Executor Popups/Splash first
-    # This catches Delta's 'Welcome Back' window and the 'Taking Too Long' loading screen.
-    ok, out = run_root(f"dumpsys window windows 2>/dev/null | grep -iE 'Delta|Welcome|Key|Fisch|Taking' | head -5")
-    if ok and out.strip():
-        return False, "Executor-Popup", "manual-window-check"
-
-    # 2. Cek Activity (Standard check)
+    # 1. Cek Activity (Standard check)
     act = get_current_activity(pkg)
-    loading_keywords = ["Taking", "Welcome", "Key", "Delta"]
-    if act and any(k.lower() in act.lower() for k in loading_keywords):
-        return False, act, "loading-activity"
-
     if act:
-        # Jika Activity adalah RobloxActivity, kita check lagi via backup/API
+        # Jika Activity adalah RobloxActivity/GameActivity, kita lanjut check
         if "RobloxActivity" in act or "GameActivity" in act:
-            pass # OK, proceed to API/Network check
+            pass
         else:
             return False, act, "wrong-activity"
 
-    # 3. Check Presence API (Metode Verification)
+    # 2. Check Presence API (Metode Verification)
     if cookie_info:
         uid, cookie = cookie_info
         ingame, place, st_type, job = check_user_presence(uid, cookie)
@@ -744,7 +820,7 @@ def is_in_game(pkg, cookie_info=None):
         if st_type in [0, 1]:
             return False, "Offline/Lobby", "presence-api"
 
-    # 4. Check Network (Fallback)
+    # 3. Check Network (Fallback)
     if has_active_connection(pkg):
         return True, "Network Active", "network"
 
@@ -753,12 +829,52 @@ def is_in_game(pkg, cookie_info=None):
 # ==========================================================
 #  MENU 1 — START AUTO REJOIN (tanpa cookie)
 # ==========================================================
+# --- REUSABLE HELPERS ---------------------------------------
+def get_win_bounds(pkg, do_float, tot, sw, sh, index):
+    """
+    Deteksi bounds window Roblox aktual via dumpsys.
+    Return (x1, y1, x2, y2) atau fallback ke grid/fullscreen.
+    """
+    ok, out = run_root(
+        f"dumpsys window windows 2>/dev/null | grep -A10 '{pkg}' | grep 'Frame:'"
+    )
+    if ok and out.strip():
+        m = re.search(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', out)
+        if m:
+            x1, y1 = int(m.group(1)), int(m.group(2))
+            x2, y2 = int(m.group(3)), int(m.group(4))
+            if x2 > x1 and y2 > y1:
+                return x1, y1, x2, y2
+    # Fallback ke grid
+    if do_float and tot > 1:
+        bounds_str = grid_bounds(index, tot, sw, sh)
+        try:
+            x1, y1, x2, y2 = map(int, bounds_str.split(","))
+            return x1, y1, x2, y2
+        except:
+            pass
+    return 0, 0, sw, sh
+
+def do_smart_tap_wrapper(pkg, do_float, tot, sw, sh, index, label=""):
+    """Tap tengah window Roblox. Bawa ke foreground dulu."""
+    x1, y1, x2, y2 = get_win_bounds(pkg, do_float, tot, sw, sh, index)
+    smart_tap_burst(pkg, x1, y1, x2, y2)
+    return (x1+x2)//2, (y1+y2)//2, "burst-center"
+
 def watch_package(a, cfg, accounts, sw, sh, tot, wh_url,
                   do_float, do_mute, do_lowgfx, interval, stop_event):
     """
     Worker thread — monitor satu package secara independen.
-    Tiap package punya thread sendiri, jadi rejoin/tap paralel.
     """
+    try: # Ensure thread-level safety
+        _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
+                           do_float, do_mute, do_lowgfx, interval, stop_event)
+    except Exception as e:
+        log(f"CRITICAL: Watcher thread for {a.get('pkg')} DEAD: {e}", "ERROR")
+        a["status"] = f"Thread Error ❌"
+
+def _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
+                        do_float, do_mute, do_lowgfx, interval, stop_event):
     import threading
 
     pkg          = a["pkg"]
@@ -768,105 +884,10 @@ def watch_package(a, cfg, accounts, sw, sh, tot, wh_url,
     auto_tap     = cfg.get("auto_tap_splash", True)
     tap_interval = cfg.get("tap_interval", 3)
 
-    # Hitung posisi tap sesuai grid bounds package ini
-    def get_win_bounds():
-        """
-        Deteksi bounds window Roblox aktual via dumpsys.
-        Return (x1, y1, x2, y2) atau fallback ke grid/fullscreen.
-        """
-        ok, out = run_root(
-            f"dumpsys window windows 2>/dev/null | grep -A10 '{pkg}' | grep 'Frame:'"
-        )
-        if ok and out.strip():
-            m = re.search(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', out)
-            if m:
-                x1, y1 = int(m.group(1)), int(m.group(2))
-                x2, y2 = int(m.group(3)), int(m.group(4))
-                if x2 > x1 and y2 > y1:
-                    return x1, y1, x2, y2
-        # Fallback ke grid
-        if do_float and tot > 1:
-            bounds_str = grid_bounds(a["index"], tot, sw, sh)
-            try:
-                x1, y1, x2, y2 = map(int, bounds_str.split(","))
-                return x1, y1, x2, y2
-            except:
-                pass
-        return 0, 0, sw, sh
-
     def do_smart_tap(label=""):
-        """Tap tengah window Roblox. Bawa ke foreground dulu."""
-        x1, y1, x2, y2 = get_win_bounds()
-        if _SMART_TAP:
-            tx, ty, reason = _tap_helper.smart_tap(pkg, x1, y1, x2, y2)
-        else:
-            _tap_helper_fallback(pkg, x1, y1, x2, y2)
-            tx, ty, reason = (x1+x2)//2, (y1+y2)//2, "manual"
+        tx, ty, reason = do_smart_tap_wrapper(pkg, do_float, tot, sw, sh, a["index"], label)
         a["status"] = f"Tap[{reason}] ({label})"
         return tx, ty, reason
-
-    def is_splash_screen():
-        """
-        ULTRA-ACCURATE SPLASH DETECTION
-        Targets: Roblox Splash, Delta Executor Popups, and Launcher Fragments.
-        """
-        # 1. Search Activity Stack AND Window Stack
-        # Use window dump to find titles like "NO MERCY DELTA LITE"
-        ok, out = run_root(
-            f"dumpsys window windows 2>/dev/null | grep -iE 'mCurrentFocus|mFocusedApp|{pkg}|Delta' | head -30"
-        )
-        if not ok or not out:
-            # Fallback to activity top if window dump fails
-            ok, out = run_root(f"dumpsys activity top 2>/dev/null | grep -iE '{pkg}' | head -15")
-        
-        if not out: return None
-
-        # Primary Activity Targets
-        splash_activities = [
-            ".ActivityProtocolLaunch", # Official Roblox Splash
-            "Delta",                   # Delta Executor
-            "Fluxus",                  # Fluxus Executor
-            "SplashActivity",          # Generic Executor Splash
-            "KeySystem"                # Key system prompts
-        ]
-        
-        # Keywords seen in screenshots (e.g., 'Taking Too Long', 'Welcome Back', 'Fisch')
-        splash_keywords = [
-            "Welcome", "Protocol", "Fisch", "Delta",
-            "Launch", "Loading", "Too", "Long", "Taking",
-            "Key", "Press", "Continue"
-        ]
-        
-        out_lower = out.lower()
-
-        # Step 1: Check for known Splash/Executor activities
-        for act in splash_activities:
-            if act.lower() in out_lower:
-                return f"Splash_Act({act})"
-        
-        # Step 2: Check for text fragments in the window dump
-        for kw in splash_keywords:
-            if kw.lower() in out_lower:
-                return f"Keyword({kw})"
-
-        # Step 3: Package logic fallback
-        # If we see the package name but NOT the main GameActivity, we are loading.
-        if pkg.lower() in out_lower:
-            if "robloxactivity" not in out_lower and "gameactivity" not in out_lower:
-                return "LauncherStatus"
-
-        return None
-
-    def tap_burst(detected_as, count=3):
-        """Tap tengah window sebanyak `count` kali dengan jeda singkat."""
-        x1, y1, x2, y2 = get_win_bounds()
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
-        log(f"{pkg}: Splash detected [{detected_as}] → burst tap {count}x at ({cx},{cy})", "INFO")
-        a["status"] = f"Splash tap x{count} [{detected_as}]"
-        for _ in range(count):
-            run_root(f"input tap {cx} {cy} 2>/dev/null || true")
-            time.sleep(0.15)
 
     def do_rejoin(reason):
         """Rejoin package ini."""
@@ -901,6 +922,7 @@ def watch_package(a, cfg, accounts, sw, sh, tot, wh_url,
         a["status"] = "Relaunching..."
         bounds = grid_bounds(a["index"], tot, sw, sh) if do_float else None
         launch_game(link, pkg, bounds)
+        a["launch_time"] = time.time()  # Reset grace period setiap rejoin
         time.sleep(5)
 
         if do_mute:   mute_roblox(pkg)
@@ -909,41 +931,45 @@ def watch_package(a, cfg, accounts, sw, sh, tot, wh_url,
 
         # Auto tap + inject autoexec sampai in-game
         injected_ae  = False
-        game_entered = False
-        total_wait   = max(ae_delay + 10, 40)
+        
+        # --- NEW TIMER LOGIC (YURXZ v9.1.5) ---
+        # Toggleable via auto_tap_splash (auto_tap variable)
+        if auto_tap:
+            l_delay = cfg.get("load_delay", 40)
+            a["status"] = f"Wait {l_delay}s load..."
+            log(f"{pkg}: Starting {l_delay}s load timer...", "INFO")
+            
+            for t in range(l_delay, 0, -1):
+                if stop_event.is_set():
+                    return
 
-        for t in range(total_wait, 0, -1):
-            if stop_event.is_set():
-                return
+                a["status"] = f"Wait Load ({t}s)"
+                # Log tiap 1 detik supaya kelihatan "tik-tik" di bot
+                log(f"{pkg}: Loading... {t}s remaining", "INFO")
 
-            # Cek via is_in_game (Activity + Network + API)
-            ingame_now, activity, _ = is_in_game(pkg, a.get("cookie_info"))
-
-            if ingame_now and not game_entered:
-                game_entered = True
-                a["status"]  = f"In-game! {activity}"
-                log(f"{pkg}: Game loaded, activity={activity}", "INFO")
-                if ae_script and not injected_ae:
+                # Tetap injek autoexec di tengah-tengah loading
+                if ae_script and not injected_ae and t <= (l_delay // 2):
                     a["status"] = "Inject autoexec..."
                     inject_autoexec(pkg, ae_script)
                     injected_ae = True
-                break
+                    
+                time.sleep(1)
 
-            # Auto tap: disabled per user request
-            # if auto_tap and not game_entered:
-            #     splash_kw = is_splash_screen()
-            #     if splash_kw:
-            #         tap_burst(splash_kw, count=3)
-            #     else:
-            #         act_str = activity or "loading"
-            #         do_smart_tap(f"{act_str} {t}s")
+            # Final 3s countdown buat tap burst
+            for t in range(3, 0, -1):
+                a["status"] = f"Burst TAP in {t}s"
+                if t == 3: log(f"{pkg}: Preparing tap burst in 3s...", "INFO")
+                time.sleep(1)
 
-            if not injected_ae and t <= ae_delay and ae_script:
+            log(f"{pkg}: Tapping Skip Burst (3x Center)...", "INFO")
+            do_smart_tap("Wait End")
+            time.sleep(2)
+        else:
+            # Fast track: Inject AE immediately if timer is off
+            if ae_script and not injected_ae:
                 a["status"] = "Inject autoexec..."
                 inject_autoexec(pkg, ae_script)
                 injected_ae = True
-
-            time.sleep(1)
 
         a["status"] = f"Running ✅ (rejoin #{a['rejoin_count']})"
         if wh_url:
@@ -953,17 +979,29 @@ def watch_package(a, cfg, accounts, sw, sh, tot, wh_url,
     # ── Main monitoring loop untuk package ini ─────────────
     while not stop_event.is_set():
         try:
-            # Cek 1: app running?
-            if not is_running(pkg):
-                do_rejoin("App mati / crash")
+            # ── GRACE PERIOD: Skip API check 120s setelah launch/rejoin ──
+            # Presence API bisa sangat lambat (basi) saat baru launch.
+            # Kita kasih nafas 120 detik agar API punya waktu update ke In-Game.
+            launch_time = a.get("launch_time", 0)
+            elapsed     = time.time() - launch_time
+            # Only skip for grace period IF it's actually running. 
+            # If not running, REJOIN IMMEDIATELY no matter what timer says.
+            if elapsed < 30 and is_running(pkg):
+                remaining = int(30 - elapsed)
+                a["status"] = f"Loading... ({remaining}s)"
+                log(f"[{pkg}] Grace period: {remaining}s sisa (skip API)", "INFO")
+                # Sleep sebentar saja agar UI update lancar
+                time.sleep(min(5, remaining + 1))
                 continue
 
-            # Cek 2: Presence API (Mandatory)
+            # ── METODE: PRESENCE API (PRIMARY) ──
             if a.get("cookie_info"):
                 uid, cookie = a["cookie_info"]
                 api_ingame, api_place, p_type, api_job = check_user_presence(uid, cookie)
                 
-                # Ekstrak target placeId dan deteksi PS link
+                a["method"] = "presence-api"
+                
+                # Validation logic
                 target_place = None; is_ps = False
                 ps_lnk_str = str(a.get("ps_link", ""))
                 if "placeId=" in ps_lnk_str:
@@ -972,8 +1010,15 @@ def watch_package(a, cfg, accounts, sw, sh, tot, wh_url,
                 if "roblox.com/share" in ps_lnk_str or "privateServerLinkCode" in ps_lnk_str:
                     is_ps = True
                 
-                # VALIDASI: In-Game?
                 ingame = api_ingame
+
+                # ── GHOST DETECTION (DISABLED) ──
+                # User requested to skip network check and just use Presence API.
+                # if ingame:
+                #     if not has_active_connection(pkg):
+                #         log(f"[{pkg}] Ghost Session detected (API says InGame but No Network).", "WARN")
+                #         ingame = False
+                #         a["status"] = "Ghost Session 👻"
 
                 if ingame and target_place and api_place and int(api_place) != target_place:
                     ingame = False
@@ -992,22 +1037,20 @@ def watch_package(a, cfg, accounts, sw, sh, tot, wh_url,
                         a["last_job_id"] = None
                 
                 if not ingame:
-                    # REJOIN SEGERA TANPA LOADING COUNT JIKA API BILANG OFFLINE/LOBBY
                     reason = "Offline/Lobby"
                     if p_type == 1: reason = "Lobby/Menu"
-                    if p_type == 0: reason = "Offline"
-                    if a.get("status"): reason = a["status"]
+                    if a.get("status") and any(x in a["status"] for x in ["Wrong", "Job", "Migration", "Ghost"]):
+                        reason = a["status"]
                     
                     do_rejoin(reason)
                     a["last_job_id"] = None
                     continue
                 else:
-                    # Stabil in-game
-                    a["loading_count"] = 0
+                    if not (a.get("status") and any(x in a["status"] for x in ["Wait", "Burst", "Tap"])):
+                        a["status"] = "In-game ✅"
                     protect_app(pkg)
-                    a["status"] = "In-game ✅ API"
             else:
-                a["status"] = "No Cookie - Presence Fail"
+                a["status"] = "No Cookie - Standby"
                 time.sleep(5)
                 continue
 
@@ -1021,7 +1064,9 @@ def watch_package(a, cfg, accounts, sw, sh, tot, wh_url,
                 st_labels = {0: "Offline", 1: "Online", 2: "InGame", 3: "Studio", 4: "Online"}
                 p_str = st_labels.get(p_type, "Unknown") if p_type is not None else "N/A"
                 
-                log(f"[{pkg}] {a.get('username','?')}: {new_st} (Presence: {p_str})", "INFO")
+                # Tambah ID dan Nama supaya user bisa verifikasi akun
+                u_id = a.get("cookie_info", [0])[0] if a.get("cookie_info") else "N/A"
+                log(f"[{pkg}] User:{a.get('username','?')} (ID:{u_id}): {new_st} (API Type:{p_type})", "INFO")
                 a["last_log_status"] = new_st
                 a["last_log_time"]   = now
 
@@ -1031,6 +1076,7 @@ def watch_package(a, cfg, accounts, sw, sh, tot, wh_url,
         time.sleep(interval)
 
 def menu_start_rejoin():
+    global MONITOR_DATA, BOT_COMMAND
     if not check_root():
         print(f"{RE}Root access required!{R}")
         wait_enter(); return
@@ -1066,10 +1112,11 @@ def menu_start_rejoin():
         wait_enter(); return
 
     interval      = 20 if ARGS.preventif else cfg.get("check_interval", 35)
-    restart_delay = cfg.get("restart_delay", 10)
+    restart_delay = 1 # Accelerated from 10
     do_float      = cfg.get("floating_window", True)
     do_mute       = cfg.get("auto_mute", True)
     do_lowgfx     = cfg.get("auto_low_graphics", True)
+    do_tap        = cfg.get("auto_tap_splash", True)
     wh_url        = cfg.get("webhook_url", "")
 
     if ARGS.low:
@@ -1107,23 +1154,69 @@ def menu_start_rejoin():
             "freeze_count":  0,
             "rejoin_count":  0,
             "cookie_info":   cookie_info,
-            "username":      username
+            "username":      username,
+            "launch_time":   time.time(),  # Grace period tracker
         })
 
-    run_root("setenforce 0")
+    # --- Initial Push of MONITOR_DATA for Discord Bot visibility ---
+    try:
+        MONITOR_DATA = [
+            {
+                "pkg":      x.get("pkg", "?"),
+                "status":   "Initializing...",
+                "username": x.get("username", "Unknown"),
+                "rejoin":   0,
+                "method":   "auto"
+            } for x in accounts
+        ]
+    except:
+        pass
+
+    # Skip UI-heavy commands if in background to avoid hangs
+    if sys.stdout.isatty():
+        run_root("setenforce 0")
+    else:
+        # Background mode: move root check elsewhere or skip invasive commands
+        pass
 
     # -- Launch awal semua package -------------------------
     for i, a in enumerate(accounts):
         pkg  = a["pkg"]
         link = a["ps_link"]
 
+        # --- SMART START: Skip if already good ---
+        already_good = False
+        if a["cookie_info"]:
+            uid, cookie = a["cookie_info"]
+            ingame, _, _, _ = check_user_presence(uid, cookie)
+            if ingame:
+                log(f"{pkg}: Already In-Game (Presence API), skipping initial force-stop.", "INFO")
+                already_good = True
+        
+        if not already_good and is_running(pkg):
+            # If no cookie, we can only check if it's running.
+            pass
+
+        if already_good:
+            a["status"] = "Running ✅ (Skipped Launch)"
+            a["launch_time"] = time.time()
+            continue
+
         a["status"] = "Force stop..."
         draw_ui(accounts, "Launching", f"[{i+1}/{tot}]")
-        force_stop(pkg)
+        log(f"{pkg}: Force stopping... (Reason: Not detected In-Game)", "INFO")
+        try:
+            force_stop(pkg)
+        except Exception as e:
+            log(f"Force stop error {pkg}: {e}", "ERROR")
 
         a["status"] = "Clear cache..."
         draw_ui(accounts, "Launching", f"[{i+1}/{tot}]")
-        clear_cache_safe(pkg)
+        log(f"{pkg}: Clearing cache...", "INFO")
+        try:
+            clear_cache_safe(pkg)
+        except Exception as e:
+            log(f"Clear cache error {pkg}: {e}", "ERROR")
 
         a["status"] = "Launching..."
         draw_ui(accounts, "Launching", f"[{i+1}/{tot}]")
@@ -1158,17 +1251,34 @@ def menu_start_rejoin():
             log(f"Launch awal {pkg} → GAGAL", "WARN")
 
         if i < tot - 1:
-            for t in range(restart_delay, 0, -1):
-                draw_ui(accounts, "Launching", f"Next in {t}s")
-                time.sleep(1)
+            # Accelerated stagger for "no matter what" launch
+            time.sleep(1)
 
-    # Tunggu game load
-    for t in range(20, 0, -1):
-        draw_ui(accounts, "Initializing", f"Wait {t}s")
+    # Tunggu game load (YURXZ v9.1 — 40s wait + All-click skip)
+    # Accelerated initial load wait
+    for t in range(25, 0, -1):
+        draw_ui(accounts, "Initializing", f"Wait Load {t}s")
+        if t % 5 == 0: log(f"Global Wait: {t}s remaining...", "INFO")
+        time.sleep(1)
+
+    # Burst tap 1x semua package setelah load selesai (selalu, tanpa kondisi)
+    for t in range(3, 0, -1):
+        draw_ui(accounts, "Initializing", f"Burst Tap in {t}s")
+        log(f"Burst Tap in {t}s...", "INFO")
         time.sleep(1)
 
     for a in accounts:
-        a["status"] = "Running ✅" if is_running(a["pkg"]) else "Not Running ⚠️"
+        a["status"] = "Click Skip..."
+        pkg_short   = a['pkg'].replace('com.roblox.', 'rb.')
+        draw_ui(accounts, "Initializing", f"Tap: {pkg_short}")
+        log(f"Burst tap: {a['pkg']}", "INFO")
+        do_smart_tap_wrapper(a["pkg"], do_float, tot, sw, sh, a["index"], "Initial")
+        time.sleep(0.5)
+
+
+    for a in accounts:
+        a["status"]      = "Running ✅" if is_running(a["pkg"]) else "Not Running ⚠️"
+        a["launch_time"] = time.time()  # Reset grace period untuk check pertama
 
     last_wh    = time.time()
     stop_event = __import__('threading').Event()
@@ -1204,33 +1314,28 @@ def menu_start_rejoin():
 
             draw_ui(accounts, "Monitoring", f"{tot} pkg aktif", nxt_wh)
 
-            # --- Update status.json untuk bot.py ---
+            # --- Update global MONITOR_DATA for direct Bot access (Zero file latency) ---
             try:
-                data = [{"pkg": x["pkg"], "status": x["status"], "username": x["username"]} for x in accounts]
-                with open("status.json", "w") as f_st:
-                    json.dump(data, f_st)
+                MONITOR_DATA = [
+                    {
+                        "pkg":      x.get("pkg", "?"),
+                        "status":   x.get("status", "?"),
+                        "username": x.get("username", "Unknown"),
+                        "rejoin":   x.get("rejoin_count", 0),
+                        "method":   x.get("method", "auto")
+                    } for x in accounts
+                ]
             except: pass
-            try:
-                if os.path.exists(CMD_FILE):
-                    with open(CMD_FILE) as f:
-                        cmd = f.read().strip()
-                    os.remove(CMD_FILE)
-                    if cmd == "stop":
-                        raise KeyboardInterrupt
-                    elif cmd == "start":
-                        pass  # sudah jalan, ignore
-            except KeyboardInterrupt:
-                raise
-            except:
-                pass
-
-            # Simpan status
-            try:
-                with open(STATUS_FILE, "w") as f:
-                    json.dump([{"pkg": x["pkg"], "status": x["status"],
-                                "rejoin": x.get("rejoin_count", 0)} for x in accounts], f)
-            except:
-                pass
+            # --- Check Bot Commands via Global Flag (Direct Memory) ---
+            cmd_now = BOT_COMMAND
+            if cmd_now:
+                BOT_COMMAND = None
+                if cmd_now == "stop":
+                    log("Direct CMD: stop received", "INFO")
+                    raise KeyboardInterrupt
+                elif cmd_now == "start":
+                    log("Direct CMD: start received while running, restarting sequence...", "INFO")
+                    raise InterruptedError
 
             # Cek tombol q dengan timeout 1s agar loop tidak tight (mengurangi resiko force close)
             try:
@@ -1254,18 +1359,21 @@ def menu_start_rejoin():
             except:
                 time.sleep(2)
 
+    except InterruptedError:
+        # Signal for restart (from bot start command)
+        stop_event.set()
+        print(f"\n{YE}[!] Restarting sequence per bot command...{R}")
+        for t in threads:
+            t.join(timeout=2)
+        return "restart"
+
     except KeyboardInterrupt:
         stop_event.set()
-        # Hapus cmd file kalau ada
-        try:
-            if os.path.exists(CMD_FILE): os.remove(CMD_FILE)
-            if os.path.exists(STATUS_FILE): os.remove(STATUS_FILE)
-            if os.path.exists("status.json"): os.remove("status.json")
-        except: pass
         print(f"\n{YE}[!] Menghentikan semua thread...{R}")
         for t in threads:
             t.join(timeout=3)
         print(f"{YE}[!] Dihentikan.{R}\n")
+        return "stop"
 
 def _send_webhook_nocookie(url, accounts, title="📊 Status Update", color=3447003):
     try:
@@ -1512,6 +1620,7 @@ def menu_list_config():
     rows = [
         ("Interval", f"{cfg.get('check_interval', 35)}s"),
         ("Delay",    f"{cfg.get('restart_delay', 10)}s"),
+        ("Load Delay", f"{cfg.get('load_delay', 40)}s"),
         ("Floating", yn("floating_window")),
         ("Mute",     yn("auto_mute")),
         ("LowGfx",   yn("auto_low_graphics")),
@@ -1562,6 +1671,8 @@ def menu_set_interval():
     if val.isdigit(): cfg["check_interval"] = int(val)
     val2 = inp_text(f"{YE}Restart delay (detik) [Enter skip]: {R}")
     if val2.isdigit(): cfg["restart_delay"] = int(val2)
+    val3 = inp_text(f"{YE}Load delay (detik) [Enter skip]: {R}")
+    if val3.isdigit(): cfg["load_delay"] = int(val3)
     save_cfg(cfg)
     print(f"{GR}✓ Tersimpan!{R}")
     wait_enter()
@@ -1962,80 +2073,34 @@ def parse_sequence(c):
         parts = [c]
     return [p for p in parts if p]
 
+# Flag komunikasi antara watcher thread dan main loop
+_exit_flag    = {"exit": False}
+
+def _cmd_watcher():
+    """Thread background: poll flag BOT_COMMAND.
+    Removed CMD_FILE polling as requested by user."""
+    global BOT_COMMAND
+    while not _exit_flag["exit"]:
+        try:
+            # Jika BOT_COMMAND flag sudah ada (DARI BOT DIRECT), trigger refresh stdin
+            if BOT_COMMAND:
+                # Interrupt inp() dengan mengirim newline ke stdin
+                try:
+                    run_root(f"echo '' >> /proc/{os.getpid()}/fd/0 2>/dev/null; true")
+                except: pass
+        except:
+            pass
+        time.sleep(0.5)
+
 def main():
-    if ARGS.auto:
-        if not check_root():
-            print(f"{RE}Root required!{R}"); sys.exit(1)
-            
-        # ───── PROTEKSI TERMUX ─────
-        # 1. Wake Lock Termux
-        run_root("termux-wake-lock")
-        # 2. Set Highest OOM Priority untuk diri sendiri
-        protect_app(None)
-        
-        # Write PID file (agar bot.py bisa deteksi)
-        try:
-            with open("rejoin.pid", "w") as f:
-                f.write(str(os.getpid()))
-        except: pass
-        
-        log("Start dengan --auto","INFO")
-        try:
-            menu_start_rejoin()
-        finally:
-            # Hapus PID file saat exit
-            if os.path.exists("rejoin.pid"):
-                os.remove("rejoin.pid")
-        return
+    # Global PID file for bot detection
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except: pass
 
-    MENU_FN = {
-        "1":  menu_start_rejoin,
-        "2":  menu_detect_packages,
-        "3":  menu_set_global_ps,
-        "4":  menu_set_per_pkg_ps,
-        "5":  menu_clear_config,
-        "6":  menu_list_config,
-        "7":  menu_setup_webhook,
-        "8":  menu_set_interval,
-        "9":  lambda: menu_toggle("floating_window", "Floating Window"),
-        "10": lambda: menu_toggle("auto_mute", "Auto Mute"),
-        "11": lambda: menu_toggle("auto_low_graphics", "Low Grafik"),
-        "12": lambda: menu_toggle("auto_tap_splash", "Auto Tap Splash"),
-        "13": menu_autoexec,
-        "14": menu_diagnostic,
-        "15": menu_lihat_log,
-    }
-
+    # Start watcher thread immediately so --auto mode also listens for bot commands
     import threading as _threading
-
-    # Flag komunikasi antara watcher thread dan main loop
-    _bot_cmd_flag = {"cmd": None}
-    _exit_flag    = {"exit": False}
-
-    def _cmd_watcher():
-        """Thread background: poll CMD_FILE tiap 0.5 detik.
-        Tidak terblokir oleh inp() di main loop."""
-        while not _exit_flag["exit"]:
-            try:
-                if os.path.exists(CMD_FILE):
-                    with open(CMD_FILE) as f:
-                        cmd = f.read().strip()
-                    os.remove(CMD_FILE)
-                    if cmd in ("start", "stop"):
-                        _bot_cmd_flag["cmd"] = cmd
-                        log(f"Bot CMD diterima: {cmd}", "INFO")
-                        # Interrupt inp() dengan mengirim newline ke stdin
-                        try:
-                            import subprocess as _sp
-                            _sp.run(["su", "-c",
-                                     f"echo '' >> /proc/{os.getpid()}/fd/0 2>/dev/null; true"],
-                                    capture_output=True, timeout=2)
-                        except:
-                            pass
-            except:
-                pass
-            time.sleep(0.5)
-
     watcher_t = _threading.Thread(target=_cmd_watcher, daemon=True)
     watcher_t.start()
 
@@ -2043,91 +2108,144 @@ def main():
     def handle_sig_exit(s, f):
         _exit_flag["exit"] = True
         sys.exit(0)
-    signal.signal(signal.SIGINT, handle_sig_exit)
-    signal.signal(signal.SIGTERM, handle_sig_exit)
+    
+    # Signalling only works in the MAIN THREAD. 
+    # Since we are now running as a thread inside Bot, we skip this to avoid crash.
+    try:
+        signal.signal(signal.SIGINT, handle_sig_exit)
+        signal.signal(signal.SIGTERM, handle_sig_exit)
+    except (ValueError, RuntimeError):
+        pass # Not in main thread
 
-    redraw_needed = True
-    while True:
-        # Cek flag dari watcher atau signal
-        if _exit_flag["exit"]:
-            break
+    try:
+        if ARGS.auto:
+            if not check_root():
+                print(f"{RE}Root required!{R}"); sys.exit(1)
+                
+            # ───── PROTEKSI TERMUX ─────
+            # 1. Wake Lock Termux
+            run_root("termux-wake-lock")
+            # 2. Set Highest OOM Priority untuk diri sendiri
+            protect_app(None)
             
-        cmd_now = _bot_cmd_flag["cmd"]
-        if cmd_now:
-            _bot_cmd_flag["cmd"] = None
-            if cmd_now == "start":
-                log("Bot CMD: start rejoin", "INFO")
-                clear()
-                menu_start_rejoin()
-                redraw_needed = True
-                continue
-            elif cmd_now == "stop":
-                log("Bot CMD: stop", "INFO")
+            while True:
+                log("Start dengan --auto","INFO")
+                res = menu_start_rejoin()
+                if res == "stop": break
+                # If "restart", loop will call it again
+                time.sleep(1)
+            return
+
+        MENU_FN = {
+            "1":  menu_start_rejoin,
+            "2":  menu_detect_packages,
+            "3":  menu_set_global_ps,
+            "4":  menu_set_per_pkg_ps,
+            "5":  menu_clear_config,
+            "6":  menu_list_config,
+            "7":  menu_setup_webhook,
+            "8":  menu_set_interval,
+            "9":  lambda: menu_toggle("floating_window", "Floating Window"),
+            "10": lambda: menu_toggle("auto_mute", "Auto Mute"),
+            "11": lambda: menu_toggle("auto_low_graphics", "Low Grafik"),
+            "12": lambda: menu_toggle("auto_tap_splash", "Auto Tap Splash"),
+            "13": menu_autoexec,
+            "14": menu_diagnostic,
+            "15": menu_lihat_log,
+        }
+
+        redraw_needed = True
+        while True:
+            # Cek flag dari watcher atau signal
+            if _exit_flag["exit"]:
+                break
+                
+            cmd_now = _bot_cmd_flag["cmd"]
+            if cmd_now:
+                _bot_cmd_flag["cmd"] = None
+                if cmd_now == "start":
+                    log("Bot CMD: start rejoin", "INFO")
+                    clear()
+                    menu_start_rejoin()
+                    redraw_needed = True
+                    continue
+                elif cmd_now == "stop":
+                    log("Bot CMD: stop", "INFO")
+                    _exit_flag["exit"] = True
+                    break
+
+            if redraw_needed:
+                reset_terminal()
+                print_banner()
+                print(f"{GY}  Tip: 231 = urut Menu2,Menu3,Menu1{R}\n")
+                flush_stdin()
+                sys.stdout.write(f"  {YE}Enter choice: {R}")
+                sys.stdout.flush()
+                redraw_needed = False
+
+            # inp() dengan timeout 2 detik supaya watcher flag bisa dicek
+            import select as _select
+            c = ""
+            try:
+                ready, _, _ = _select.select([sys.stdin], [], [], 2)
+                if ready:
+                    c = sys.stdin.readline().strip()
+                    redraw_needed = True
+                else:
+                    # Timeout — loop ulang untuk cek bot cmd
+                    continue
+            except KeyboardInterrupt:
                 _exit_flag["exit"] = True
                 break
-
-        if redraw_needed:
-            reset_terminal()
-            print_banner()
-            print(f"{GY}  Tip: 231 = urut Menu2,Menu3,Menu1{R}\n")
-            flush_stdin()
-            sys.stdout.write(f"  {YE}Enter choice: {R}")
-            sys.stdout.flush()
-            redraw_needed = False
-
-        # inp() dengan timeout 2 detik supaya watcher flag bisa dicek
-        import select as _select
-        c = ""
-        try:
-            ready, _, _ = _select.select([sys.stdin], [], [], 2)
-            if ready:
-                c = sys.stdin.readline().strip()
-                redraw_needed = True
-            else:
-                # Timeout — loop ulang untuk cek bot cmd
+            except:
+                time.sleep(1)
                 continue
-        except KeyboardInterrupt:
-            _exit_flag["exit"] = True
-            break
-        except:
-            time.sleep(1)
-            continue
 
-        if c.strip() == "16":
-            _exit_flag["exit"] = True
-            clear(); print(f"{CY}Sampai jumpa!{R}\n"); break
-
-        sequence = parse_sequence(c.strip())
-
-        valid   = [s for s in sequence if s in MENU_FN or s == "16"]
-        invalid = [s for s in sequence if s not in MENU_FN and s != "16"]
-
-        if not valid:
-            if c.strip():
-                print(f"\n  {RE}Tidak valid: {c}{R}")
-                time.sleep(2)
-            continue
-
-        if invalid:
-            print(f"\n  {YE}Diabaikan: {', '.join(invalid)}{R}")
-            time.sleep(1)
-
-        labels    = [next((l for n, l in MENU_ITEMS if n == s), f"Menu {s}") for s in valid]
-        label_str = " -> ".join(labels)
-        if len(valid) > 1:
-            countdown_before_menu(label_str, 2)
-        else:
-            # Refresh title untuk single command biar cepet
-            sys.stdout.write(f"\r  {CY}Entering: {WH}{label_str}{R}   \n")
-            sys.stdout.flush()
-
-        for s in valid:
-            if s == "16":
+            if c.strip() == "16":
                 _exit_flag["exit"] = True
-                clear(); print(f"{CY}Sampai jumpa!{R}\n"); return
-            fn = MENU_FN.get(s)
-            if fn:
-                clear(); fn()
+                clear(); print(f"{CY}Sampai jumpa!{R}\n"); break
+
+            sequence = parse_sequence(c.strip())
+
+            valid   = [s for s in sequence if s in MENU_FN or s == "16"]
+            invalid = [s for s in sequence if s not in MENU_FN and s != "16"]
+
+            if not valid:
+                if c.strip():
+                    print(f"\n  {RE}Tidak valid: {c}{R}")
+                    time.sleep(2)
+                continue
+
+            if invalid:
+                print(f"\n  {YE}Diabaikan: {', '.join(invalid)}{R}")
+                time.sleep(1)
+
+            labels    = [next((l for n, l in MENU_ITEMS if n == s), f"Menu {s}") for s in valid]
+            label_str = " -> ".join(labels)
+            if len(valid) > 1:
+                countdown_before_menu(label_str, 2)
+            else:
+                # Refresh title untuk single command biar cepet
+                sys.stdout.write(f"\r  {CY}Entering: {WH}{label_str}{R}   \n")
+                sys.stdout.flush()
+
+            for s in valid:
+                if s == "16":
+                    _exit_flag["exit"] = True
+                    clear(); print(f"{CY}Sampai jumpa!{R}\n"); return
+                fn = MENU_FN.get(s)
+                if fn:
+                    clear()
+                    res = fn()
+                    if res == "stop": 
+                        _exit_flag["exit"] = True
+                        break
+    finally:
+        # Hapus PID file saat exit (entah itu auto atau menu)
+        pid_file = os.path.join(BASE_DIR, "rejoin.pid")
+        if os.path.exists(pid_file):
+            try: os.remove(pid_file)
+            except: pass
 
 if __name__ == '__main__':
     main()

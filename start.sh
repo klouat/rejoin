@@ -14,7 +14,7 @@ SEP2=$(printf '-%.0s' $(seq 1 $W))
 pr() { printf "${2:-$RES}  %-$((W-2))s${RES}\n" "$1"; }
 
 # ── Mode ──────────────────────────────────────────────
-MODE="${1:-menu}"  # menu | auto | bot | all | stop
+MODE="${1:-menu}"
 
 # ── Stop mode ─────────────────────────────────────────
 if [ "$MODE" = "stop" ]; then
@@ -40,30 +40,36 @@ pr "by YURXZ" "$GRY"
 echo -e "${CYA}${SEP2}${RES}"; echo ""
 
 # ── Auto install dependencies ─────────────────────────
-pr "[*] Cek & install dependencies..." "$YEL"
-pkg update -y -q 2>/dev/null
+if [ ! -f "$DIR/.deps_installed" ]; then
+    pr "[*] Cek & install dependencies..." "$YEL"
+    pkg update -y -q 2>/dev/null
 
-install_if_missing() {
-    if ! command -v "$1" &>/dev/null; then
-        pr "  -> Install $2..." "$YEL"
-        pkg install -y "$2" -q 2>/dev/null
-    else
-        pr "  v $1 sudah ada" "$GRE"
-    fi
-}
-install_if_missing python3 python
-install_if_missing pip3 python-pip
-install_if_missing nano nano
+    install_if_missing() {
+        if ! command -v "$1" &>/dev/null; then
+            pr "  -> Install $2..." "$YEL"
+            pkg install -y "$2" -q 2>/dev/null
+        else
+            pr "  v $1 sudah ada" "$GRE"
+        fi
+    }
+    install_if_missing python3 python
+    install_if_missing pip3 python-pip
+    install_if_missing nano nano
 
-for pkg_py in requests websocket-client; do
-    if ! python3 -c "import ${pkg_py//-/_}" 2>/dev/null; then
-        pr "  -> pip install $pkg_py..." "$YEL"
-        pip3 install "$pkg_py" -q
-    else
-        pr "  v $pkg_py sudah ada" "$GRE"
-    fi
-done
-echo ""; pr "[v] Dependencies OK" "$GRE"; echo ""
+    for pkg_py in requests websocket-client; do
+        if ! python3 -c "import ${pkg_py//-/_}" 2>/dev/null; then
+            pr "  -> pip install $pkg_py..." "$YEL"
+            pip3 install "$pkg_py" -q
+        else
+            pr "  v $pkg_py sudah ada" "$GRE"
+        fi
+    done
+
+    touch "$DIR/.deps_installed"
+    echo ""; pr "[v] Dependencies OK" "$GRE"; echo ""
+else
+    pr "[v] Dependencies sudah terinstall, skip." "$GRE"; echo ""
+fi
 
 # ── Wakelock ──────────────────────────────────────────
 pr "[*] Aktifkan wakelock..." "$YEL"
@@ -95,69 +101,60 @@ fi
 export TERM=xterm-256color
 stty sane 2>/dev/null || true
 
-# ── Jalankan sesuai mode ──────────────────────────────
+# ── Start bot.py (always, nohup, background) ──────────
+start_bot() {
+    pkill -f "bot.py" 2>/dev/null
+    sleep 1
+    pr "[*] Start bot di background (nohup)..." "$YEL"
+    nohup python3 -u "$DIR/bot.py" >> "$DIR/bot.log" 2>&1 &
+    BOT_PID=$!
+    echo $BOT_PID > "$DIR/bot.pid"
+    sleep 2
+    if kill -0 $BOT_PID 2>/dev/null; then
+        pr "  v Bot berjalan (PID: $BOT_PID)" "$GRE"
+        pr "  v Log: $DIR/bot.log" "$GRY"
+    else
+        pr "  x Bot GAGAL jalan! Cek bot.log:" "$RED"
+        tail -5 "$DIR/bot.log" | while read line; do pr "    $line" "$RED"; done
+    fi
+}
+
 echo -e "${CYA}${SEP}${RES}"
 
 if [ "$MODE" = "bot" ]; then
-    # Hanya bot
-    pr "[*] Menjalankan Bot saja..." "$CYA"
+    pr "[*] Menjalankan Bot saja (foreground)..." "$CYA"
     echo -e "${CYA}${SEP}${RES}"; echo ""
     while true; do
-        python3 "$DIR/bot.py"
+        python3 -u "$DIR/bot.py"
         EXIT=$?
         [ $EXIT -eq 0 ] || [ $EXIT -eq 130 ] && break
         pr "[!] Bot crash. Restart 10 detik..." "$RED"; sleep 10
     done
 
 elif [ "$MODE" = "all" ] || [ "$MODE" = "auto" ]; then
-    # Bot background + Rejoin foreground (menu tetap muncul)
     pr "[*] Menjalankan Bot (background) + Rejoin (foreground)..." "$CYA"
     echo -e "${CYA}${SEP}${RES}"; echo ""
-
-    # Bot jalan di background
-    if [ -f "$DIR/bot_config.json" ]; then
-        # Matiin bot lama kalau ada
-        pkill -f "bot.py" 2>/dev/null
-        sleep 1
-        pr "[*] Start bot di background..." "$YEL"
-        nohup python3 "$DIR/bot.py" > "$DIR/bot.log" 2>&1 &
-        echo $! > "$DIR/bot.pid"
-        pr "  v Bot jalan di background (PID: $(cat $DIR/bot.pid))" "$GRE"
-        pr "  v Log bot: $DIR/bot.log" "$GRY"
-    else
-        pr "  ! bot_config.json tidak ada" "$YEL"
-        pr "    Setup bot: python3 bot.py setup" "$GRY"
-    fi
+    start_bot
     echo ""
     pr "[*] Menjalankan Rejoin di foreground..." "$CYA"
     echo -e "${CYA}${SEP}${RES}"; echo ""
-
-    # Rejoin jalan foreground dengan menu (bisa dilihat + dikontrol)
     while true; do
-        python3 "$DIR/main.py"
+        python3 -u "$DIR/main.py"
         EXIT=$?
         [ $EXIT -eq 0 ] || [ $EXIT -eq 130 ] && break
         pr "[!] Rejoin crash (code $EXIT). Restart 10 detik..." "$RED"; sleep 10
     done
 
 else
-    # Mode menu default — bot background, rejoin foreground
+    # Default menu mode
     pr "[*] Menjalankan menu..." "$CYA"
     echo -e "${CYA}${SEP}${RES}"; echo ""
-
-    # Bot di background kalau config ada
-    if [ -f "$DIR/bot_config.json" ]; then
-        pkill -f "bot.py" 2>/dev/null
-        sleep 1
-        pr "[*] Start bot di background..." "$YEL"
-        nohup python3 "$DIR/bot.py" > "$DIR/bot.log" 2>&1 &
-        echo $! > "$DIR/bot.pid"
-        pr "  v Bot jalan di background (PID: $(cat $DIR/bot.pid))" "$GRE"; echo ""
-    fi
-
-    # Rejoin foreground dengan menu
+    start_bot
+    echo ""
+    pr "[*] Menjalankan Rejoin di foreground..." "$CYA"
+    echo -e "${CYA}${SEP}${RES}"; echo ""
     while true; do
-        python3 "$DIR/main.py"
+        python3 -u "$DIR/main.py"
         EXIT=$?
         [ $EXIT -eq 0 ] || [ $EXIT -eq 130 ] && break
         pr "[!] Crash (code $EXIT). Restart 10 detik..." "$RED"; sleep 10

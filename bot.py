@@ -18,11 +18,17 @@ Setup:
 import os, sys, json, time, subprocess, threading, re
 from pathlib import Path
 
+# Import main.py logic directly (Zero latency)
+try:
+    import main as rejoin_module
+except ImportError:
+    # Fallback if main.py is missing (unlikely)
+    rejoin_module = None
+
 # ── Path ────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config.json"
 LOG_FILE    = BASE_DIR / "activity.log"
-STATUS_FILE = BASE_DIR / "status.json"
 PID_FILE    = BASE_DIR / "rejoin.pid"
 BOT_CFG     = BASE_DIR / "bot_config.json"
 BOT_LOG     = BASE_DIR / "bot.log"
@@ -66,11 +72,10 @@ def load_main_cfg():
     return {}
 
 def load_status():
-    if STATUS_FILE.exists():
-        try:
-            with open(STATUS_FILE) as f:
-                return json.load(f)
-        except: pass
+    """Read status directly from memory (Fast). In-process only."""
+    # Memory check only (Now strictly no status.json)
+    if rejoin_module and rejoin_module.MONITOR_DATA:
+        return rejoin_module.MONITOR_DATA
     return []
 
 def find_cookie_for_pkg(pkg):
@@ -149,62 +154,77 @@ def take_screenshot():
 # PID file untuk tools (start.sh)
 TOOLS_PID_FILE = BASE_DIR / "tools.pid"
 
-CMD_FILE = BASE_DIR / ".bot_cmd"
+# --- Commands -----------------------------------------------
 
 def write_cmd(cmd):
-    """Tulis perintah ke file yang dibaca main.py."""
-    try:
-        with open(str(CMD_FILE), "w") as f:
-            f.write(cmd)
+    """Set command directly in main module memory."""
+    if rejoin_module:
+        rejoin_module.BOT_COMMAND = cmd
         return True
-    except:
-        return False
+    return False
 
-def run_tools(target_pkgs=None):
+def run_tools(target_pkgs=None, auto=True):
     """Versi Stabil: Python yang memegang kontrol Background (Bukan Shell)."""
+    mode_str = "AUTO" if auto else "MENU"
+    print(f"\n{YE}[Bot] Meminta start tools mode: {mode_str}...{R}", flush=True)
+
     if is_rejoin_running():
+        # Cek apakah itu proses kita atau bukan
+        print(f"{YE}[Bot] Periksa status... Tools terdeteksi sudah jalan.{R}", flush=True)
         return False, "Tools sudah jalan!"
     
-    main_py = str(BASE_DIR / "main.py")
+    cfg        = load_main_cfg()
+    main_py    = str(BASE_DIR / "main.py")
     python_exe = sys.executable or "python3"
-    log_f = str(BASE_DIR / "tools.log")
-    launcher = str(BASE_DIR / "_launch.sh")
+    log_f      = str(BASE_DIR / "tools.log")
+    launcher   = str(BASE_DIR / "_launch.sh")
 
-    # 1. Update Launcher (Auto-Restart Loop)
     pkg_arg = f"--packages '{','.join(target_pkgs)}'" if target_pkgs else ""
+    prefix  = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
     
-    prefix = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
-    with open(launcher, "w") as f:
-        f.write("#!/bin/sh\n")
-        f.write(f"export PATH=$PATH:{prefix}/bin\n")
-        f.write(f"cd '{BASE_DIR}'\n")
-        f.write("while true; do\n")
-        # Protect termux PID again before starting
-        f.write(f"  su -c 'echo -1000 > /proc/$$/oom_score_adj' 2>/dev/null\n")
-        f.write(f"  '{python_exe}' '{main_py}' --auto {pkg_arg} >> '{log_f}' 2>&1\n")
-        f.write("  echo 'Main script crashed or killed. Restarting in 5s...' >> '" + str(log_f) + "'\n")
-        f.write("  sleep 5\n")
-        f.write("done\n")
-    os.chmod(launcher, 0o755)
+    if auto:
+        # Mode AUTO: Pakai launcher loop + su -c (Root)
+        with open(launcher, "w") as f:
+            f.write("#!/bin/sh\n")
+            f.write(f"export PATH=$PATH:{prefix}/bin\n")
+            f.write(f"cd '{BASE_DIR}'\n")
+            f.write("while true; do\n")
+            f.write(f"  su -c 'echo -1000 > /proc/$$/oom_score_adj' 2>/dev/null\n")
+            f.write(f"  '{python_exe}' '{main_py}' --auto {pkg_arg} >> '{log_f}' 2>&1\n")
+            f.write("  echo 'Main script crashed or killed. Restarting in 5s...' >> '" + str(log_f) + "'\n")
+            f.write("  sleep 5\n")
+            f.write("done\n")
+        os.chmod(launcher, 0o755)
+        cmd = ["sh", launcher]
+    else:
+        # Mode MENU: Jalankan sebagai user biasa (seperti 'python main.py')
+        # main.py akan handle su -c sendiri untuk aksi yang butuh root.
+        cmd = [python_exe, main_py]
+        if target_pkgs:
+            cmd += ["--packages", ",".join(target_pkgs)]
 
-    # 2. Jalankan via su TANPA '&' (Python yang handle background)
-    cmd_su = ["su", "-c", f"sh '{launcher}'"]
-    cfg    = load_main_cfg()
-    pkgs   = target_pkgs if target_pkgs else cfg.get("packages", [])
-    
-    print(f"\n{GY}[Bot] Memulai Root Launch: {' '.join(cmd_su)}{R}")
-    if pkgs:
-        print(f"{GY}[Bot] Menyiapkan monitoring untuk ({'Selective' if target_pkgs else 'All'}):{R}")
-        for p in pkgs:
-            print(f"      {GR}✓{R} {p}")
+    print(f"{GY}[Bot] Exec: {' '.join(cmd)}{R}", flush=True)
     
     try:
-        # Acquire Termux Wake Lock
         subprocess.run(["termux-wake-lock"], capture_output=True)
-        # Popen process ini jalan di background secara otomatis
-        subprocess.Popen(cmd_su, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if auto:
+            # Direct In-Process Monitor (Zero File Intermediaries)
+            def run_main_in_thread():
+                # Inject ARGS to main.py before running
+                if rejoin_module:
+                    rejoin_module.ARGS.auto     = True
+                    rejoin_module.ARGS.packages = ",".join(target_pkgs) if target_pkgs else None
+                    rejoin_module.main() # Start the main loop
+            
+            t = threading.Thread(target=run_main_in_thread, name="MonitorThread", daemon=True)
+            t.start()
+            bot_log("Launched in-process monitor thread.")
+            return True, "✅ Rejoin dimulai (Internal Thread aktif)!"
+        else:
+            # Menu mode stays as a separate window for manual interact
+            subprocess.Popen(cmd)
     except Exception as e:
-        print(f"{RE}[Bot] Popen Error: {e}{R}")
+        print(f"{RE}[Bot] Launch Error: {e}{R}", flush=True)
         return False, f"❌ Error: {e}"
 
     # 3. Tunggu monitoring (Hanya butuh bbrp detik kalau lancar)
@@ -214,32 +234,94 @@ def run_tools(target_pkgs=None):
         if is_rejoin_running():
             print(f"{GR}[Bot] ✅ Berhasil Jalan! ✓{R}")
             
-            # ── LIVE STATUS TOGGLE ──
-            def _live_logger():
-                print(f"{CY}[Bot] Monitoring Mode: LIVE LOG AKTIF{R}")
-                last_line = ""
+            # ── LIVE MONITOR (Mimic Manual Main.py UI in Terminal) ──
+            def _terminal_monitor():
+                print(f"{CY}[Bot] Monitoring Mode: TERMINAL LOG AKTIF{R}")
+                time.sleep(2)
+                
                 while is_rejoin_running():
                     try:
-                        # Monitoring logs saja
+                        # Clear screen and move to home like main.py
+                        sys.stdout.write("\033[H\033[2J")
+                        sys.stdout.flush()
+                        
+                        # Load stats derived from status.json (updated by main.py)
+                        status_data = load_status()
+                        cfg         = load_main_cfg()
+                        
+                        W = 44
+                        try:
+                            import shutil
+                            W = shutil.get_terminal_size().columns
+                        except: pass
+                        W = max(30, W - 1)
+                        
+                        div = f"{CY}{'='*W}{R}"
+                        sep = f"{CY}{'-'*W}{R}"
+                        
+                        # -- Header --
+                        print(div)
+                        print(f"{MG}YURXZ Rejoin Bot | Monitor Live{R}")
+                        print(sep)
+                        print(f"{YE}Status: MONITORING ACTIVE{R}")
+                        print(f"{GY}Bot is handling Discord commands...{R}")
+                        print(sep)
+                        
+                        # -- Accounts --
+                        if not status_data:
+                            print(f"{GY}Menunggu data dari session...{R}")
+                        else:
+                            mtd_labels = {
+                                "activity":     "[A]",
+                                "network":      "[N]",
+                                "cpu":          "[C]",
+                                "pidof":        "[P]",
+                                "presence-api": "[API]",
+                            }
                             
-                        # Baca baris terakhir dari activity.log
-                        if os.path.exists(LOG_FILE):
-                            with open(LOG_FILE, "r") as f:
-                                lines = f.readlines()
-                                if lines:
-                                    curr = lines[-1].strip()
-                                    if curr != last_line:
-                                        print(f"\n{GY}[LOG]{R} {curr[:70]:<70}", end="")
-                                        last_line = curr
-                    except: pass
-                    time.sleep(1)
-                print(f"\n{RE}[Bot] Monitoring berhenti.{R}")
+                            for s in status_data:
+                                pkg    = s.get("pkg", "?").replace("com.roblox.", "rb.")
+                                st     = s.get("status", "?")
+                                rj     = s.get("rejoin", 0)
+                                uname  = s.get("username", "Unknown")
+                                mtd    = s.get("method", "auto")
+                                lbl    = mtd_labels.get(mtd, "[-] ")
+                                
+                                color = GR
+                                if any(x in st for x in ["Restart","Launch","Wait","Cache","Stop","Loading"]): color = YE
+                                elif any(x in st for x in ["Error","Failed","Crash","Freeze","Offline"]): color = RE
+                                
+                                # Header (Label + Pkg + User)
+                                print(f"{CY}{lbl} {pkg} ({uname}){R}")
+                                # Status line
+                                print(f"{color}{st[:W-6]:<{W-6}}{R} ({rj}x)")
+                                print(sep)
+                        
+                        # -- Footer --
+                        print(div)
+                        print(f"{GY}[Bot Hub] Tekan Ctrl+C untuk paksa stop bot{R}")
+                        sys.stdout.flush()
+                        
+                    except Exception as e:
+                        bot_log(f"Monitor error: {e}")
+                    
+                    time.sleep(2) # Refresh rate
+
+                # When finished
+                print(f"\n{RE}[Bot] Monitoring berhenti (Tools Mati).{R}")
+                time.sleep(1)
+                print(f"{CY}[Bot] Kembali ke UI Bot dasar...{R}\n")
             
-            threading.Thread(target=_live_logger, daemon=True).start()
+            if auto: # Only start monitor if in background loop where we don't own the terminal
+                threading.Thread(target=_terminal_monitor, daemon=True).start()
             
             # Buat list launching
-            launch_txt = "\n".join([f"🚀 Launching `{p}`..." for p in (target_pkgs or cfg.get("packages", []))])
-            msg = f"▶ ✅ Tools dimulai! Monitoring Aktif.\n\n{launch_txt}"
+            if auto:
+                all_pkgs = target_pkgs or cfg.get("packages", [])
+                launch_txt = "\n".join([f"🚀 Launching `{p}`..." for p in all_pkgs])
+                msg = f"▶ ✅ Tools dimulai! Monitoring Aktif.\n\n{launch_txt}"
+            else:
+                msg = "🛠 ✅ Tools dimulai dalam mode **MENU** di terminal."
             return True, msg
             
     print(f"{RE}[Bot] Timeout Gagal Start. Cek izin Root di HP!{R}")
@@ -267,23 +349,13 @@ def start_rejoin():
     if not write_cmd("start"):
         return False, "❌ Gagal kirim perintah."
 
-    # Tunggu main.py masuk mode rejoin (status.json akan berubah)
-    status_before = ""
-    try:
-        if STATUS_FILE.exists():
-            status_before = open(str(STATUS_FILE)).read()
-    except:
-        pass
-
+    # Tunggu main.py masuk mode rejoin (MONITOR_DATA akan berubah)
+    last_len = len(load_status())
+    
     for i in range(15):
         time.sleep(1)
-        try:
-            if STATUS_FILE.exists():
-                status_now = open(str(STATUS_FILE)).read()
-                if status_now != status_before and status_now.strip():
-                    return True, "✅ Rejoin dimulai!"
-        except:
-            pass
+        if len(load_status()) != last_len or any(x.get('status') != 'Pending' for x in load_status()):
+            return True, "✅ Rejoin dimulai (Thread monitor aktif)!"
 
     # Kalau status belum berubah, cukup assume berhasil kalau masih running
     if is_rejoin_running():
@@ -307,11 +379,23 @@ def is_rejoin_running():
     # 2. Cek via pgrep dan ps (fallback)
     try:
         # Pgrep cmdline (lebih pakem di android)
+        # Cari proses python yang menjalankan main.py
         r = subprocess.run(["pgrep", "-f", "main.py"], 
-                           capture_output=True, timeout=5)
-        if r.returncode == 0: return True
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            # Filter pids yang valid / ada di proc
+            for pid in r.stdout.strip().split():
+                if os.path.exists(f"/proc/{pid}"):
+                    return True
         
-        r = subprocess.run(["su", "-c", "ps -A -o CMDLINE | grep 'main.py' | grep -v grep"], 
+        # Cek apakah launcher shell-nya masih idup
+        r = subprocess.run(["pgrep", "-f", "_launch.sh"], 
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+             return True
+
+        # Last resort: su -c ps (bisa lihat proses root juga)
+        r = subprocess.run(["su", "-c", "ps -A | grep 'main.py' | grep -v grep"], 
                            capture_output=True, text=True, timeout=5)
         if "main.py" in r.stdout: return True
     except:
@@ -596,25 +680,25 @@ class DiscordBot:
                 "components": [
                     {
                         "type": 2,
-                        "label": "🔧 Run Tools",
-                        "style": 3 if not running else 2,
-                        "custom_id": "btn_run_tools",
+                        "label": "⚙️ Edit Config",
+                        "style": 2,
+                        "custom_id": "btn_edit_config",
                     },
                     {
                         "type": 2,
-                        "label": "🔴 Stop Tools",
+                        "label": "🔴 Kill Everything",
                         "style": 4,
                         "custom_id": "btn_stop_tools",
                     },
                     {
                         "type": 2,
-                        "label": "🚀 Rejoin ALL",
+                        "label": "🚀 Start Rejoin",
                         "style": 3,
                         "custom_id": "btn_start",
                     },
                     {
                         "type": 2,
-                        "label": "🎯 Rejoin Specific",
+                        "label": "🎯 Selective",
                         "style": 1,
                         "custom_id": "btn_run_specific",
                     },
@@ -754,19 +838,30 @@ class DiscordBot:
             return
 
         bot_log(f"Button: {custom_id} dari user {user_id}")
+        print(f"{CY}[Bot] Interaction: {YE}{custom_id}{R} (User: {user_id})", flush=True)
 
-        if custom_id == "btn_run_tools":
-            # Respond dulu supaya tidak timeout
-            try:
-                self.respond_interaction(interaction_id, interaction_token,
-                    content="🔧 Menjalankan tools...", ephemeral=True)
-            except: pass
-
-            def _run(token):
-                ok, msg = run_tools()
-                self.edit_interaction_response(token, content=f"🔧 {msg}")
-                time.sleep(3); self.refresh_panel()
-            threading.Thread(target=_run, args=(interaction_token,), daemon=True).start()
+        if custom_id == "btn_edit_config":
+            cfg = load_main_cfg()
+            # Max 5 components in modal
+            # Formatting boolean flags for easier edit
+            flags = ",".join([
+                "T" if cfg.get("floating_window", True) else "F",
+                "T" if cfg.get("auto_mute", True) else "F",
+                "T" if cfg.get("auto_low_graphics", True) else "F",
+                "T" if cfg.get("auto_tap_splash", True) else "F"
+            ])
+            
+            self.respond_modal(
+                interaction_id, interaction_token,
+                "modal_edit_config", "Edit Configuration",
+                [
+                    {"type": 1, "components": [{"type": 4, "custom_id": "check_interval", "label": "Check Interval (s)", "style": 1, "value": str(cfg.get("check_interval", 35)), "required": True}]},
+                    {"type": 1, "components": [{"type": 4, "custom_id": "restart_delay", "label": "Restart Delay (s)", "style": 1, "value": str(cfg.get("restart_delay", 10)), "required": True}]},
+                    {"type": 1, "components": [{"type": 4, "custom_id": "load_delay", "label": "Load Delay (s)", "style": 1, "value": str(cfg.get("load_delay", 40)), "required": True}]},
+                    {"type": 1, "components": [{"type": 4, "custom_id": "packages", "label": "Packages (comma separated)", "style": 2, "value": ",".join(cfg.get("packages", [])), "required": False}]},
+                    {"type": 1, "components": [{"type": 4, "custom_id": "flags", "label": "Flags: Float,Mute,LowGfx,Tap (T/F)", "style": 1, "value": flags, "placeholder": "T,T,T,T", "required": True}]}
+                ]
+            )
 
         elif custom_id == "btn_run_specific":
             cfg = load_main_cfg()
@@ -943,6 +1038,7 @@ class DiscordBot:
                 f"**PS Link Global:** `{ps_link[:60]}`",
                 f"**Check Interval:** {interval}s",
                 f"**Restart Delay:** {delay}s",
+                f"**Load Delay:** {cfg.get('load_delay',40)}s",
                 f"**Webhook:** {'Ada ✅' if webhook else 'Kosong ❌'}",
                 "",
                 f"**Floating Window:** {on if floating else off}",
@@ -1183,6 +1279,41 @@ class DiscordBot:
                     time.sleep(2); self.refresh_panel()
                 except:
                     pass
+
+        elif custom_id == "modal_edit_config":
+            try:
+                cfg = load_main_cfg()
+                
+                # Parse basic numeric fields
+                try:
+                    cfg["check_interval"] = int(values.get("check_interval", 35))
+                    cfg["restart_delay"]  = int(values.get("restart_delay", 10))
+                    cfg["load_delay"]     = int(values.get("load_delay", 40))
+                except: pass
+                
+                cfg["webhook_url"] = values.get("webhook_url", "").strip()
+                
+                # Parse packages
+                pkgs_raw = values.get("packages", "")
+                cfg["packages"] = [p.strip() for p in pkgs_raw.split(",") if p.strip()]
+                
+                # Parse flags (T,T,T,T)
+                flags_raw = values.get("flags", "T,T,T,T").split(",")
+                if len(flags_raw) >= 4:
+                    cfg["floating_window"]    = flags_raw[0].strip().upper() == "T"
+                    cfg["auto_mute"]          = flags_raw[1].strip().upper() == "T"
+                    cfg["auto_low_graphics"]  = flags_raw[2].strip().upper() == "T"
+                    cfg["auto_tap_splash"]    = flags_raw[3].strip().upper() == "T"
+                
+                with open(str(CONFIG_FILE), "w") as f:
+                    json.dump(cfg, f, indent=2)
+                
+                self.respond_interaction(interaction_id, interaction_token,
+                    content="✅ Configuration updated successfully!", ephemeral=True)
+                time.sleep(1); self.refresh_panel()
+            except Exception as e:
+                self.respond_interaction(interaction_id, interaction_token,
+                    content=f"❌ Error updating config: {e}", ephemeral=True)
 
         elif custom_id == "modal_run_script":
             script = values.get("script_code")
@@ -1496,7 +1627,11 @@ def main():
         owner_ids  = cfg.get("owner_ids", [])
     )
 
-    print(f"{GR}[Bot] Connecting to Discord...{R}\n")  # Keep startup message
+    print(f"{GR}[Bot] Connecting to Discord...{R}\n")
+    
+    # Initial refresh: ensures panel is up to date on start
+    # We no longer auto-run tools on start; wait for Discord command.
+
     try:
         bot.run_gateway()
     except KeyboardInterrupt:

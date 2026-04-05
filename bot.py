@@ -698,9 +698,9 @@ class DiscordBot:
                     },
                     {
                         "type": 2,
-                        "label": "🎯 Selective",
+                        "label": "➕ Add AutoExec",
                         "style": 1,
-                        "custom_id": "btn_run_specific",
+                        "custom_id": "btn_add_autoexec",
                     },
                     {
                         "type": 2,
@@ -756,13 +756,19 @@ class DiscordBot:
                     },
                     {
                         "type": 2,
-                        "label": "� Set PS Link",
+                        "label": "🔗 Set PS Link",
                         "style": 1,
                         "custom_id": "btn_set_ps",
                     },
                     {
                         "type": 2,
-                        "label": "�🔄 Refresh",
+                        "label": "🗑 Remove Auto Exec",
+                        "style": 4,
+                        "custom_id": "btn_remove_ae",
+                    },
+                    {
+                        "type": 2,
+                        "label": "🔄 Refresh",
                         "style": 2,
                         "custom_id": "btn_refresh",
                     },
@@ -863,37 +869,7 @@ class DiscordBot:
                 ]
             )
 
-        elif custom_id == "btn_run_specific":
-            cfg = load_main_cfg()
-            pkgs = cfg.get("packages", [])
-            options = [
-                {"label": f"{p[:20]}..", "value": p, "emoji": {"name": "🎮"}} 
-                for p in pkgs[:25]
-            ]
-            if not options:
-                self.respond_interaction(interaction_id, interaction_token, 
-                    content="❌ Tidak ada package terdeteksi. Silakan **Detect Pkg** dulu.", ephemeral=True)
-                return
 
-            self.respond_interaction(interaction_id, interaction_token,
-                content="🚀 **Pilih account untuk Rejoin:**",
-                components=[
-                    {
-                        "type": 1,
-                        "components": [
-                            {
-                                "type": 3,
-                                "custom_id": "select_launch_pkgs",
-                                "placeholder": "Pilih 1 atau lebih...",
-                                "options": options,
-                                "min_values": 1,
-                                "max_values": len(options)
-                            }
-                        ]
-                    }
-                ],
-                ephemeral=True
-            )
 
         elif custom_id == "btn_stop_tools":
             self.respond_interaction(interaction_id, interaction_token,
@@ -1177,19 +1153,59 @@ class DiscordBot:
                 ]
             )
 
-        elif custom_id == "select_launch_pkgs":
-            selected = data.get("values", [])
-            if not selected: return
+        elif custom_id == "btn_remove_ae":
+            import subprocess
+            folder = "/storage/emulated/0/Delta/Autoexecute"
+            r = subprocess.run(["su", "-c", f"ls -1 {folder}/*.lua 2>/dev/null"], capture_output=True, text=True)
+            files = [f.strip().split('/')[-1] for f in r.stdout.splitlines() if f.strip()]
+            
+            if not files:
+                self.respond_interaction(interaction_id, interaction_token,
+                    content="❌ **Tidak ada script AutoExecute yang ditemukan.**", ephemeral=True)
+                return
+                
+            options = [{"label": f, "value": f} for f in files[:25]] # Select menu max 25 options
             
             self.respond_interaction(interaction_id, interaction_token,
-                content=f"🚀 Menjalankan selective monitoring ({len(selected)} apps)...", ephemeral=True)
-            
-            def _launch_select(token):
-                ok, msg = run_tools(target_pkgs=selected)
-                self.edit_interaction_response(token, content=f"{'✅' if ok else '❌'} {msg}")
-                time.sleep(2); self.refresh_panel()
+                content="🗑️ **Pilih script yang ingin dihapus:**",
+                components=[
+                    {
+                        "type": 1,
+                        "components": [
+                            {
+                                "type": 3, # Select Menu
+                                "custom_id": "select_delete_ae",
+                                "placeholder": "Pilih script untuk dihapus...",
+                                "options": options,
+                                "min_values": 1,
+                                "max_values": 1
+                            }
+                        ]
+                    }
+                ],
+                ephemeral=True
+            )
+
+        elif custom_id == "select_delete_ae":
+            # Values are in d["data"]["values"] for component interactions
+            selected = data.get("data", {}).get("values", [])
+            if not selected:
+                # Fallback if structure varies
+                selected = data.get("values", [])
                 
-            threading.Thread(target=_launch_select, args=(interaction_token,), daemon=True).start()
+            if not selected: return
+            filename = selected[0]
+            
+            path = f"/storage/emulated/0/Delta/Autoexecute/{filename}"
+            import subprocess
+            r = subprocess.run(["su", "-c", f"rm '{path}'"], capture_output=True, text=True)
+            
+            if r.returncode == 0:
+                self.respond_interaction(interaction_id, interaction_token,
+                    content=f"✅ **Script `{filename}` telah dihapus!**", ephemeral=True)
+            else:
+                self.respond_interaction(interaction_id, interaction_token,
+                    content=f"❌ **Gagal menghapus script:**\n`{r.stderr or r.stdout}`", ephemeral=True)
 
         elif custom_id == "btn_script":
             self.respond_modal(
@@ -1205,6 +1221,40 @@ class DiscordBot:
                                 "label": "Kode Lua",
                                 "style": 2, # Text Area
                                 "placeholder": "print('hello')",
+                                "required": True
+                            }
+                        ]
+                    }
+                ]
+            )
+
+        elif custom_id == "btn_add_autoexec":
+            self.respond_modal(
+                interaction_id, interaction_token,
+                "modal_add_autoexec", "Add AutoExecute Script",
+                [
+                    {
+                        "type": 1,
+                        "components": [
+                            {
+                                "type": 4,
+                                "custom_id": "filename",
+                                "label": "Nama File (tanpa .lua)",
+                                "style": 1,
+                                "placeholder": "myscript",
+                                "required": True
+                            }
+                        ]
+                    },
+                    {
+                        "type": 1,
+                        "components": [
+                            {
+                                "type": 4,
+                                "custom_id": "script_content",
+                                "label": "Script Content",
+                                "style": 2,
+                                "placeholder": "print('Hello AutoExecute')",
                                 "required": True
                             }
                         ]
@@ -1242,6 +1292,35 @@ class DiscordBot:
             for c in row.get("components", []):
                 values[c.get("custom_id")] = c.get("value")
 
+        if custom_id == "modal_add_autoexec":
+            name = values.get("filename", "").strip()
+            content = values.get("script_content", "")
+            if name and content:
+                if not name.endswith(".lua"):
+                    name += ".lua"
+                
+                # Sesuai path di gambar: /storage/emulated/0/Delta/Autoexecute
+                folder_path = "/storage/emulated/0/Delta/Autoexecute"
+                path        = f"{folder_path}/{name}"
+                escaped     = content.replace("'", "'\\''")
+                
+                # Buat folder jika belum ada, masukkan content, chmod
+                cmd = f"mkdir -p '{folder_path}' && printf '%s' '{escaped}' > '{path}' && chmod 666 '{path}'"
+                
+                try:
+                    import subprocess
+                    r = subprocess.run(["su", "-c", cmd], capture_output=True, text=True, timeout=10)
+                    if r.returncode == 0:
+                        self.respond_interaction(interaction_id, interaction_token,
+                            content=f"✅ **AutoExecute saved!**\n📁 Path: `{path}`", ephemeral=True)
+                    else:
+                        self.respond_interaction(interaction_id, interaction_token,
+                            content=f"❌ **Gagal simpan (Root error):**\n`{r.stderr or r.stdout}`", ephemeral=True)
+                except Exception as e:
+                    self.respond_interaction(interaction_id, interaction_token,
+                        content=f"❌ **Error:** {e}", ephemeral=True)
+            return
+
         if custom_id == "modal_set_global":
             link = values.get("ps_link", "").strip()
             if link:
@@ -1254,11 +1333,12 @@ class DiscordBot:
                 try:
                     with open(str(CONFIG_FILE), "w") as f:
                         json.dump(cfg, f, indent=2)
-                    self.edit_interaction_response(interaction_token,
-                        content=f"✅ Global PS Link set ke:\n{link}")
+                    self.respond_interaction(interaction_id, interaction_token,
+                        content=f"✅ Global PS Link set ke:\n{link}", ephemeral=True)
                     time.sleep(2); self.refresh_panel()
-                except:
-                    pass
+                except Exception as e:
+                    self.respond_interaction(interaction_id, interaction_token,
+                        content=f"❌ Gagal simpan config: {e}", ephemeral=True)
 
         elif custom_id == "modal_set_per_pkg":
             pkg  = values.get("pkg_name")

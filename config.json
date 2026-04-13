@@ -1,0 +1,15 @@
+{
+  "packages": [],
+  "ps_links": {},
+  "global_ps_link": "",
+  "check_interval": 35,
+  "restart_delay": 10,
+  "floating_window": true,
+  "auto_mute": true,
+  "auto_low_graphics": true,
+  "auto_tap_splash": true,
+  "load_delay": 40,
+  "autoexec_script": "",
+  "autoexec_filename": "autoexec.lua",
+  "webhook_url": ""
+}

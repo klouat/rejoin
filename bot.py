@@ -32,10 +32,16 @@ LOG_FILE    = BASE_DIR / "activity.log"
 PID_FILE    = BASE_DIR / "rejoin.pid"
 BOT_CFG     = BASE_DIR / "bot_config.json"
 BOT_LOG     = BASE_DIR / "bot.log"
+MAX_BOT_LOG_BYTES = 512 * 1024
 
 def bot_log(msg):
     """Log ke file, tidak tampil di terminal."""
     try:
+        if BOT_LOG.exists() and BOT_LOG.stat().st_size > MAX_BOT_LOG_BYTES:
+            old = BOT_LOG.with_suffix(BOT_LOG.suffix + ".old")
+            if old.exists():
+                old.unlink()
+            BOT_LOG.replace(old)
         with open(str(BOT_LOG), "a") as f:
             f.write(f"[{time.strftime('%d/%m %H:%M:%S')}] {msg}\n")
     except:
@@ -368,11 +374,17 @@ def is_tools_running():
 
 def is_rejoin_running():
     """Cek apakah main.py sedang jalan di background."""
+    now = time.time()
+    cache = getattr(is_rejoin_running, "_cache", (0, False))
+    if now - cache[0] < 2:
+        return cache[1]
+
     # 1. Cek file PID (paling akurat)
     if PID_FILE.exists():
         try:
             pid = PID_FILE.read_text().strip()
             if pid and os.path.exists(f"/proc/{pid}"):
+                is_rejoin_running._cache = (now, True)
                 return True
         except: pass
 
@@ -386,20 +398,25 @@ def is_rejoin_running():
             # Filter pids yang valid / ada di proc
             for pid in r.stdout.strip().split():
                 if os.path.exists(f"/proc/{pid}"):
+                    is_rejoin_running._cache = (now, True)
                     return True
         
         # Cek apakah launcher shell-nya masih idup
         r = subprocess.run(["pgrep", "-f", "_launch.sh"], 
                            capture_output=True, text=True, timeout=5)
         if r.returncode == 0 and r.stdout.strip():
+             is_rejoin_running._cache = (now, True)
              return True
 
         # Last resort: su -c ps (bisa lihat proses root juga)
         r = subprocess.run(["su", "-c", "ps -A | grep 'main.py' | grep -v grep"], 
                            capture_output=True, text=True, timeout=5)
-        if "main.py" in r.stdout: return True
+        if "main.py" in r.stdout:
+            is_rejoin_running._cache = (now, True)
+            return True
     except:
         pass
+    is_rejoin_running._cache = (now, False)
     return False
 
 def stop_tools():
@@ -441,38 +458,33 @@ def run_lua_script(script_text, pkg=None):
     cfg  = load_main_cfg()
     pkgs = [pkg] if pkg else cfg.get("packages", [])
     if not pkgs:
-        return False, "Tidak ada package Roblox!"
+        pkgs = ["com.roblox.client"]
+
+    filename = (cfg.get("autoexec_filename") or "autoexec.lua").strip().split("/")[-1].split("\\")[-1]
+    if not filename.endswith(".lua"):
+        filename += ".lua"
 
     results = []
     for p in pkgs:
-        base_data   = f"/data/data/{p}/files"
-        base_sdcard = f"/sdcard/Android/data/{p}/files"
         escaped     = script_text.replace("'", "'\\''")
 
-        # Scan folder executor
-        injected = 0
-        for base in [base_data, base_sdcard]:
-            r, out = subprocess.run(
-                ["su", "-c", f"ls '{base}' 2>/dev/null"],
-                capture_output=True, text=True
-            ).returncode, subprocess.run(
-                ["su", "-c", f"ls '{base}' 2>/dev/null"],
-                capture_output=True, text=True
-            ).stdout
-
-            for folder in out.split():
-                for subpath in [
-                    f"{base}/{folder}/autoexec/autoexec.lua",
-                    f"{base}/{folder}/workspace/autoexec.lua",
-                ]:
-                    folder_path = "/".join(subpath.split("/")[:-1])
-                    subprocess.run(
-                        ["su", "-c", f"mkdir -p '{folder_path}' && printf '%s' '{escaped}' > '{subpath}' && chmod 666 '{subpath}'"],
-                        capture_output=True, timeout=5
-                    )
-                    injected += 1
-
-        results.append(f"{p}: {injected} path")
+        candidates = [
+            f"/storage/emulated/0/Android/data/{p}/files/gloop/external/Autoexecute",
+            "/storage/emulated/0/Delta/Autoexecute",
+        ]
+        folder = None
+        for candidate in candidates:
+            r = subprocess.run(["su", "-c", f"test -d '{candidate}'"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                folder = candidate
+                break
+        folder = folder or candidates[0]
+        path = f"{folder}/{filename}"
+        r = subprocess.run(
+            ["su", "-c", f"mkdir -p '{folder}' && printf '%s' '{escaped}' > '{path}' && chmod 666 '{path}'"],
+            capture_output=True, text=True, timeout=10
+        )
+        results.append(f"{p}: {'OK' if r.returncode == 0 else 'Gagal'} {path}")
 
     return True, "\n".join(results)
 
@@ -514,6 +526,8 @@ class DiscordBot:
         self.last_msg_id = None
         self.panel_msg_id = None  # ID pesan panel utama
         self.is_running  = True  # Flag untuk loop utama bot
+        self._auto_refresh_started = False
+        self._running_cache = (0, False)
 
     def api(self, method, endpoint, **kwargs):
         url = f"{DISCORD_API}{endpoint}"
@@ -616,6 +630,30 @@ class DiscordBot:
             requests.patch(url, headers=self.headers, json=payload, timeout=15)
         except Exception as e:
             print(f"{RE}Edit interaction error: {e}{R}")
+
+    def followup_interaction_file(self, interaction_token, file_path, filename="screenshot.png", content=""):
+        """Send an ephemeral interaction follow-up with one attachment."""
+        url = f"{DISCORD_API}/webhooks/{self.token.split('.')[0]}/{interaction_token}"
+        payload = {
+            "content": content,
+            "flags": 64,
+            "attachments": [{"id": 0, "filename": filename}],
+        }
+        try:
+            with open(file_path, "rb") as f:
+                r = requests.post(
+                    url,
+                    data={"payload_json": json.dumps(payload)},
+                    files={"files[0]": (filename, f, "image/png")},
+                    timeout=30,
+                )
+            if r.status_code not in (200, 204):
+                bot_log(f"Screenshot upload failed: HTTP {r.status_code} {r.text[:300]}")
+                return False, f"Discord upload gagal: HTTP {r.status_code}"
+            return True, "OK"
+        except Exception as e:
+            bot_log(f"Screenshot upload error: {e}")
+            return False, str(e)
 
     def get_gateway(self):
         """Ambil gateway URL."""
@@ -996,7 +1034,6 @@ class DiscordBot:
             mute     = cfg.get("auto_mute", True)
             lowgfx   = cfg.get("auto_low_graphics", True)
             auto_tap = cfg.get("auto_tap_splash", True)
-            ae_delay = cfg.get("autoexec_delay", 30)
             ae_script= cfg.get("autoexec_script", "")
 
             on  = "✅ ON"
@@ -1022,7 +1059,6 @@ class DiscordBot:
                 f"**Low Grafik:** {on if lowgfx else off}",
                 f"**Auto Tap Splash:** {on if auto_tap else off}",
                 "",
-                f"**AutoExec Delay:** {ae_delay}s",
                 f"**AutoExec Script:** {'Ada ✅' if ae_script else 'Kosong ❌'}",
             ]
             embed = {
@@ -1045,12 +1081,14 @@ class DiscordBot:
             def _ss(token):
                 ss_path = take_screenshot()
                 if ss_path:
-                    # Discord follow-up webhooks support files and stay ephemeral if original was
-                    url = f"{DISCORD_API}/webhooks/{self.token.split('.')[0]}/{token}"
-                    with open(ss_path, "rb") as f:
-                        requests.post(url, 
-                                     data={"payload_json": json.dumps({"content": "📸 Screenshot sekarang:", "flags": 64})},
-                                     files={"file": ("ss.png", f, "image/png")})
+                    ok, msg = self.followup_interaction_file(
+                        token,
+                        ss_path,
+                        filename="screenshot.png",
+                        content="Screenshot sekarang:"
+                    )
+                    if not ok:
+                        self.edit_interaction_response(token, content=f"Screenshot upload failed: {msg}")
                 else:
                     self.edit_interaction_response(token, content="❌ Gagal ambil screenshot (butuh root)")
             threading.Thread(target=_ss, args=(interaction_token,), daemon=True).start()
@@ -1155,16 +1193,24 @@ class DiscordBot:
 
         elif custom_id == "btn_remove_ae":
             import subprocess
-            folder = "/storage/emulated/0/Delta/Autoexecute"
-            r = subprocess.run(["su", "-c", f"ls -1 {folder}/*.lua 2>/dev/null"], capture_output=True, text=True)
-            files = [f.strip().split('/')[-1] for f in r.stdout.splitlines() if f.strip()]
+            cfg = load_main_cfg()
+            pkgs = cfg.get("packages") or ["com.roblox.client"]
+            folders = [f"/storage/emulated/0/Android/data/{p}/files/gloop/external/Autoexecute" for p in pkgs]
+            folders.append("/storage/emulated/0/Delta/Autoexecute")
+            cmd = " ; ".join(f"ls -1 '{folder}'/*.lua 2>/dev/null" for folder in folders)
+            r = subprocess.run(["su", "-c", cmd], capture_output=True, text=True)
+            files = []
+            for path in r.stdout.splitlines():
+                path = path.strip()
+                if path:
+                    files.append((path.split('/')[-1], path))
             
             if not files:
                 self.respond_interaction(interaction_id, interaction_token,
                     content="❌ **Tidak ada script AutoExecute yang ditemukan.**", ephemeral=True)
                 return
                 
-            options = [{"label": f, "value": f} for f in files[:25]] # Select menu max 25 options
+            options = [{"label": f[0], "value": f[1]} for f in files[:25]] # Select menu max 25 options
             
             self.respond_interaction(interaction_id, interaction_token,
                 content="🗑️ **Pilih script yang ingin dihapus:**",
@@ -1194,9 +1240,8 @@ class DiscordBot:
                 selected = data.get("values", [])
                 
             if not selected: return
-            filename = selected[0]
-            
-            path = f"/storage/emulated/0/Delta/Autoexecute/{filename}"
+            path = selected[0]
+            filename = path.split("/")[-1]
             import subprocess
             r = subprocess.run(["su", "-c", f"rm '{path}'"], capture_output=True, text=True)
             
@@ -1299,20 +1344,31 @@ class DiscordBot:
                 if not name.endswith(".lua"):
                     name += ".lua"
                 
-                # Sesuai path di gambar: /storage/emulated/0/Delta/Autoexecute
-                folder_path = "/storage/emulated/0/Delta/Autoexecute"
-                path        = f"{folder_path}/{name}"
+                cfg = load_main_cfg()
+                pkgs = cfg.get("packages") or ["com.roblox.client"]
+                candidates = [f"/storage/emulated/0/Android/data/{p}/files/gloop/external/Autoexecute" for p in pkgs]
+                candidates.append("/storage/emulated/0/Delta/Autoexecute")
                 escaped     = content.replace("'", "'\\''")
-                
-                # Buat folder jika belum ada, masukkan content, chmod
-                cmd = f"mkdir -p '{folder_path}' && printf '%s' '{escaped}' > '{path}' && chmod 666 '{path}'"
                 
                 try:
                     import subprocess
+                    found = None
+                    for folder_path in candidates:
+                        chk = subprocess.run(["su", "-c", f"test -d '{folder_path}'"], capture_output=True, text=True, timeout=5)
+                        if chk.returncode == 0:
+                            found = folder_path
+                            break
+                    folder_path = found or candidates[0]
+                    path = f"{folder_path}/{name}"
+                    cmd = f"mkdir -p '{folder_path}' && printf '%s' '{escaped}' > '{path}' && chmod 666 '{path}'"
                     r = subprocess.run(["su", "-c", cmd], capture_output=True, text=True, timeout=10)
                     if r.returncode == 0:
+                        cfg["autoexec_script"] = content
+                        cfg["autoexec_filename"] = name
+                        with open(str(CONFIG_FILE), "w") as f:
+                            json.dump(cfg, f, indent=2)
                         self.respond_interaction(interaction_id, interaction_token,
-                            content=f"✅ **AutoExecute saved!**\n📁 Path: `{path}`", ephemeral=True)
+                            content=f"AutoExecute saved!\nPath: `{path}`", ephemeral=True)
                     else:
                         self.respond_interaction(interaction_id, interaction_token,
                             content=f"❌ **Gagal simpan (Root error):**\n`{r.stderr or r.stdout}`", ephemeral=True)
@@ -1613,7 +1669,9 @@ class DiscordBot:
                             cleanup_counter = 0
                     except:
                         pass
-            threading.Thread(target=auto_refresh, daemon=True).start()
+            if not self._auto_refresh_started:
+                self._auto_refresh_started = True
+                threading.Thread(target=auto_refresh, daemon=True).start()
 
             # Jalankan loop websocket secara blocking di main thread
             ws_app.run_forever(ping_interval=30, ping_timeout=10)

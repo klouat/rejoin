@@ -71,6 +71,8 @@ parser.add_argument("--packages",  help="Filter: package1,package2,...")
 ARGS = parser.parse_args()
 
 PID_FILE    = os.path.join(BASE_DIR, "rejoin.pid")
+MAX_LOG_BYTES = 512 * 1024
+_LAST_PROTECT = {}
 
 # --- WARNA -------------------------------------------------
 R  = "\033[0m"
@@ -118,6 +120,11 @@ def run_root(cmd, timeout=15):
 def log(msg, lvl="INFO"):
     formatted = f"[{time.strftime('%d/%m %H:%M:%S')}][{lvl}] {msg}"
     try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > MAX_LOG_BYTES:
+            old_log = LOG_FILE + ".old"
+            if os.path.exists(old_log):
+                os.remove(old_log)
+            os.replace(LOG_FILE, LOG_FILE + ".old")
         with open(LOG_FILE, "a") as f:
             f.write(formatted + "\n")
     except:
@@ -229,6 +236,8 @@ def load_cfg():
         "auto_low_graphics": True,
         "auto_tap_splash": True,
         "load_delay": 40,
+        "autoexec_script": "",
+        "autoexec_filename": "autoexec.lua",
         "webhook_url": "",
     }
 
@@ -449,6 +458,12 @@ def protect_app(pkg=None):
     Set oom_score_adj -1000 supaya sistem tidak kill process.
     Jika pkg=None, protect diri sendiri (Termux).
     """
+    key = pkg or "__self__"
+    now = time.time()
+    if now - _LAST_PROTECT.get(key, 0) < 300:
+        return
+    _LAST_PROTECT[key] = now
+
     pids = []
     if pkg:
         ok, out = run_root(f"pidof {pkg}")
@@ -880,9 +895,10 @@ def _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
     pkg          = a["pkg"]
     link         = a["ps_link"]
     ae_script    = cfg.get("autoexec_script", "")
-    ae_delay     = cfg.get("autoexec_delay", 30)
     auto_tap     = cfg.get("auto_tap_splash", True)
     tap_interval = cfg.get("tap_interval", 3)
+    api_fail_limit = max(1, int(cfg.get("api_fail_limit", 3)))
+    strict_job_check = cfg.get("strict_job_check", False)
 
     def do_smart_tap(label=""):
         tx, ty, reason = do_smart_tap_wrapper(pkg, do_float, tot, sw, sh, a["index"], label)
@@ -944,13 +960,13 @@ def _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
                     return
 
                 a["status"] = f"Wait Load ({t}s)"
-                # Log tiap 1 detik supaya kelihatan "tik-tik" di bot
-                log(f"{pkg}: Loading... {t}s remaining", "INFO")
+                if t == l_delay or t <= 5 or t % 10 == 0:
+                    log(f"{pkg}: Loading... {t}s remaining", "INFO")
 
                 # Tetap injek autoexec di tengah-tengah loading
                 if ae_script and not injected_ae and t <= (l_delay // 2):
                     a["status"] = "Inject autoexec..."
-                    inject_autoexec(pkg, ae_script)
+                    inject_autoexec(pkg, ae_script, cfg.get("autoexec_filename", "autoexec.lua"))
                     injected_ae = True
                     
                 time.sleep(1)
@@ -968,7 +984,7 @@ def _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
             # Fast track: Inject AE immediately if timer is off
             if ae_script and not injected_ae:
                 a["status"] = "Inject autoexec..."
-                inject_autoexec(pkg, ae_script)
+                inject_autoexec(pkg, ae_script, cfg.get("autoexec_filename", "autoexec.lua"))
                 injected_ae = True
 
         a["status"] = f"Running ✅ (rejoin #{a['rejoin_count']})"
@@ -989,7 +1005,8 @@ def _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
             if elapsed < 30 and is_running(pkg):
                 remaining = int(30 - elapsed)
                 a["status"] = f"Loading... ({remaining}s)"
-                log(f"[{pkg}] Grace period: {remaining}s sisa (skip API)", "INFO")
+                if remaining <= 5 or remaining % 10 == 0:
+                    log(f"[{pkg}] Grace period: {remaining}s sisa (skip API)", "INFO")
                 # Sleep sebentar saja agar UI update lancar
                 time.sleep(min(5, remaining + 1))
                 continue
@@ -1024,28 +1041,40 @@ def _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
                     ingame = False
                     a["status"] = f"Wrong Game ({api_place})"
                 
-                # ── STRICT PRIVATE SERVER MODE ──
+                # ── PRIVATE SERVER JOB TRACKING ──
+                # Roblox Presence gameId can change/report late while the client is still healthy.
+                # Keep it for status/debug, but do not force-stop unless strict_job_check is enabled.
                 if ingame and is_ps and api_job:
                     last_job = a.get("last_job_id")
                     if not last_job:
                         a["last_job_id"] = api_job
                         log(f"[{pkg}] Recorded PS Job ID: {api_job[:8]}...", "INFO")
                     elif last_job != api_job:
-                        ingame = False
-                        a["status"] = "Job Migration"
-                        log(f"[{pkg}] Job migration: Rejoining PS...", "WARN")
-                        a["last_job_id"] = None
+                        log(f"[{pkg}] Presence job changed: {last_job[:8]} -> {api_job[:8]}", "WARN")
+                        a["last_job_id"] = api_job
+                        if strict_job_check:
+                            ingame = False
+                            a["status"] = "Job Migration"
                 
                 if not ingame:
                     reason = "Offline/Lobby"
                     if p_type == 1: reason = "Lobby/Menu"
                     if a.get("status") and any(x in a["status"] for x in ["Wrong", "Job", "Migration", "Ghost"]):
                         reason = a["status"]
-                    
+
+                    a["api_fail_count"] = a.get("api_fail_count", 0) + 1
+                    if is_running(pkg) and a["api_fail_count"] < api_fail_limit:
+                        a["status"] = f"{reason} check {a['api_fail_count']}/{api_fail_limit}"
+                        log(f"[{pkg}] API says {reason}, Roblox still running; waiting for confirm {a['api_fail_count']}/{api_fail_limit}", "WARN")
+                        time.sleep(interval)
+                        continue
+
                     do_rejoin(reason)
                     a["last_job_id"] = None
+                    a["api_fail_count"] = 0
                     continue
                 else:
+                    a["api_fail_count"] = 0
                     if not (a.get("status") and any(x in a["status"] for x in ["Wait", "Burst", "Tap"])):
                         a["status"] = "In-game ✅"
                     protect_app(pkg)
@@ -1234,14 +1263,13 @@ def menu_start_rejoin():
                 a["status"] = "Set low grafik..."
                 draw_ui(accounts, "Launching", f"[{i+1}/{tot}]")
                 set_low_graphics(pkg)
-            # Inject AutoExec kalau ada script — dengan delay supaya game loading selesai
+            # Inject AutoExec file before launch finishes so the executor can pick it up.
             ae_script = cfg.get("autoexec_script", "")
-            ae_delay  = cfg.get("autoexec_delay", 30)  # default 30 detik
             if ae_script:
                 # Inject file dulu sebelum delay (supaya executor baca saat load)
                 a["status"] = "Inject autoexec..."
                 draw_ui(accounts, "Launching", f"[{i+1}/{tot}]")
-                ok_ae, _ = inject_autoexec(pkg, ae_script)
+                ok_ae, _ = inject_autoexec(pkg, ae_script, cfg.get("autoexec_filename", "autoexec.lua"))
                 log(f"AutoExec pre-inject {'OK' if ok_ae else 'GAGAL'} untuk {pkg}", "INFO")
             time.sleep(3)
             protect_app(pkg)
@@ -1554,7 +1582,10 @@ def menu_clear_config():
     elif c == "3":
         save_cfg({"packages":[],"ps_links":{},"check_interval":35,
                   "restart_delay":10,"floating_window":True,
-                  "auto_mute":True,"auto_low_graphics":True,"webhook_url":""})
+                  "auto_mute":True,"auto_low_graphics":True,
+                  "auto_tap_splash":True,"load_delay":40,
+                  "autoexec_script":"","autoexec_filename":"autoexec.lua",
+                  "webhook_url":""})
         print(f"{GR}✓ Config direset total.{R}")
     else:
         print(f"{YE}Dibatalkan.{R}")
@@ -1625,7 +1656,6 @@ def menu_list_config():
         ("Mute",     yn("auto_mute")),
         ("LowGfx",   yn("auto_low_graphics")),
         ("AutoTap",  yn("auto_tap_splash")),
-        ("AE Delay", f"{cfg.get('autoexec_delay', 30)}s"),
         ("AutoExec", f"{GR}Ada{R}" if ae else f"{GY}Kosong{R}"),
         ("Webhook",  f"{GR}Ada{R}" if wh else f"{GY}Kosong{R}"),
     ]
@@ -1705,72 +1735,51 @@ def menu_toggle(key, label):
 # ==========================================================
 #  MENU 12 — LIHAT LOG
 # ==========================================================
-def inject_autoexec(pkg, script):
+def normalize_lua_filename(name, default="autoexec.lua"):
+    name = (name or default).strip().split("/")[-1].split("\\")[-1]
+    if not name:
+        name = default
+    if not name.endswith(".lua"):
+        name += ".lua"
+    return name
+
+def inject_autoexec(pkg, script, filename="autoexec.lua"):
     """
-    Inject script Lua ke semua executor yang ada di device.
-    Cara kerja:
-    1. Scan semua subfolder di dalam package files
-    2. Cari folder yang ada 'autoexec' di dalamnya
-    3. Inject ke sana + path generic fallback
-    Jadi support semua executor termasuk lite/clone/modded.
+    Save AutoExec Lua to the same detected folder used by the Discord button.
+    Priority:
+    1. /storage/emulated/0/Android/data/<pkg>/files/gloop/external/Autoexecute
+    2. /storage/emulated/0/Delta/Autoexecute
+    If neither exists, create the package gloop path.
     """
-    base_data   = f"/data/data/{pkg}/files"
-    base_sdcard = f"/sdcard/Android/data/{pkg}/files"
-    escaped     = script.replace("'", "'\\''")
-    paths       = []
-    injected    = []
-
-    # ── STEP 1: Scan dinamis semua subfolder executor ──────
-    for base in [base_data, base_sdcard]:
-        # List semua subfolder di base
-        ok, out = run_root(f"ls '{base}' 2>/dev/null")
-        if ok and out.strip():
-            for folder_name in out.split():
-                folder_name = folder_name.strip()
-                if not folder_name:
-                    continue
-                sub = f"{base}/{folder_name}"
-                # Cek apakah ada folder autoexec di dalamnya
-                ok2, out2 = run_root(f"ls '{sub}' 2>/dev/null")
-                if ok2 and out2:
-                    items = out2.split()
-                    if "autoexec" in items:
-                        # Ada folder autoexec → inject ke sana
-                        paths.append(f"{sub}/autoexec/autoexec.lua")
-                    if "workspace" in items:
-                        # Ada folder workspace → inject ke sana juga
-                        paths.append(f"{sub}/workspace/autoexec.lua")
-                    # Cek file autoexec.lua langsung di subfolder
-                    if "autoexec.lua" in items:
-                        paths.append(f"{sub}/autoexec.lua")
-
-    # ── STEP 2: Path generic / fallback ───────────────────
-    for base in [base_data, base_sdcard]:
-        paths += [
-            f"{base}/autoexec.lua",
-            f"{base}/autoexec/autoexec.lua",
-            f"{base}/workspace/autoexec.lua",
-        ]
-
-    # ── STEP 3: Dedupe ────────────────────────────────────
-    paths = list(dict.fromkeys(paths))
-
-    # ── STEP 4: Inject ke semua path ──────────────────────
-    for path in paths:
-        folder = "/".join(path.split("/")[:-1])
-        run_root(f"mkdir -p '{folder}' 2>/dev/null")
-        ok, _ = run_root(f"printf '%s' '{escaped}' > '{path}' && chmod 666 '{path}'")
+    candidates = [
+        f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Autoexecute",
+        "/storage/emulated/0/Delta/Autoexecute",
+    ]
+    folder = None
+    for candidate in candidates:
+        ok, _ = run_root(f"test -d '{candidate}' 2>/dev/null")
         if ok:
-            injected.append(path)
-            log(f"AutoExec OK: {path}", "INFO")
+            folder = candidate
+            break
 
-    log(f"AutoExec inject {len(injected)}/{len(paths)} path berhasil untuk {pkg}", "INFO")
-    return len(injected) > 0, injected
+    folder = folder or candidates[0]
+    filename = normalize_lua_filename(filename)
+    path = f"{folder}/{filename}"
+    escaped = script.replace("'", "'\\''")
+
+    run_root(f"mkdir -p '{folder}' 2>/dev/null")
+    ok, out = run_root(f"printf '%s' '{escaped}' > '{path}' && chmod 666 '{path}'")
+    if ok:
+        log(f"AutoExec OK: {path}", "INFO")
+        return True, [path]
+
+    log(f"AutoExec gagal untuk {pkg}: {out}", "WARN")
+    return False, []
 
 def menu_autoexec():
     cfg = load_cfg()
-    current   = cfg.get("autoexec_script", "")
-    ae_delay  = cfg.get("autoexec_delay", 30)
+    current = cfg.get("autoexec_script", "")
+    filename = normalize_lua_filename(cfg.get("autoexec_filename", "autoexec.lua"))
 
     print(f"\n{CY}[ Set AutoExec Script ]{R}")
     print(f"{GY}{'-'*get_term_width()}{R}")
@@ -1780,21 +1789,27 @@ def menu_autoexec():
         print(f"{GY}Script: {preview}{R}")
     else:
         print(f"{GY}Script: (belum ada){R}")
-    print(f"{GY}Delay inject: {ae_delay} detik setelah launch{R}")
+    print(f"{GY}Nama file: {filename}{R}")
+    print(f"{GY}AutoExec akan disimpan ke folder yang terdeteksi:{R}")
+    print(f"{GY}- /storage/emulated/0/Android/data/<pkg>/files/gloop/external/Autoexecute{R}")
+    print(f"{GY}- /storage/emulated/0/Delta/Autoexecute{R}")
     print()
 
     print(f"  {YE}1{R}. Input script baru")
-    print(f"  {YE}2{R}. Load dari file (/sdcard/Download/autoexec.lua)")
-    print(f"  {YE}3{R}. Test inject ke package sekarang")
-    print(f"  {YE}4{R}. Set delay inject (detik setelah launch)")
-    print(f"  {YE}5{R}. Hapus AutoExec")
-    print(f"  {YE}6{R}. Lihat script saat ini")
-    print(f"  {YE}7{R}. Batal")
+    print(f"  {YE}2{R}. Load dari file Lua")
+    print(f"  {YE}3{R}. Simpan ke folder AutoExecute sekarang")
+    print(f"  {YE}4{R}. Hapus AutoExec dari config")
+    print(f"  {YE}5{R}. Lihat script saat ini")
+    print(f"  {YE}6{R}. Batal")
     print(f"{GY}{'-'*get_term_width()}{R}")
 
     c = inp(f"{YE}Pilih: {R}")
 
     if c == "1":
+        name = inp_text(f"{YE}Nama file script [.lua] [{filename}]: {R}").strip()
+        if name:
+            filename = normalize_lua_filename(name)
+            cfg["autoexec_filename"] = filename
         print(f"\n{GY}Paste script Lua kamu.")
         print(f"Ketik END di baris baru untuk selesai:{R}")
         lines = []
@@ -1809,64 +1824,49 @@ def menu_autoexec():
         script = "\n".join(lines).strip()
         if script:
             cfg["autoexec_script"] = script
+            cfg["autoexec_filename"] = filename
             save_cfg(cfg)
-            print(f"\n{GR}✓ Script disimpan! ({len(lines)} baris){R}")
+            print(f"\n{GR}Script disimpan ke config. Pilih menu 3 untuk tulis ke folder AutoExecute.{R}")
         else:
             print(f"{RE}Script kosong!{R}")
 
     elif c == "2":
-        path = "/sdcard/Download/autoexec.lua"
-        ok, out = run_root(f"cat {path} 2>/dev/null")
+        source_path = inp_text(f"{YE}Path file Lua [/sdcard/Download/{filename}]: {R}").strip()
+        if not source_path:
+            source_path = f"/sdcard/Download/{filename}"
+        ok, out = run_root(f"cat '{source_path}' 2>/dev/null")
         if ok and out.strip():
             cfg["autoexec_script"] = out.strip()
+            cfg["autoexec_filename"] = normalize_lua_filename(source_path)
             save_cfg(cfg)
             lines = out.strip().split('\n')
-            print(f"\n{GR}✓ Script dimuat dari {path}! ({len(lines)} baris){R}")
+            print(f"\n{GR}Script dimuat dari {source_path}! ({len(lines)} baris){R}")
+            print(f"{GY}Pilih menu 3 untuk tulis ke folder AutoExecute.{R}")
         else:
             print(f"{RE}File tidak ditemukan atau kosong!{R}")
-            print(f"{GY}Buat file: /sdcard/Download/autoexec.lua{R}")
+            print(f"{GY}Buat file: /sdcard/Download/{filename}{R}")
 
     elif c == "3":
         script = cfg.get("autoexec_script", "")
         if not script:
             print(f"{RE}Belum ada script! Set dulu dengan pilihan 1 atau 2.{R}")
         else:
-            pkgs = cfg.get("packages", find_installed_pkgs())
-            if not pkgs:
-                print(f"{RE}Tidak ada package!{R}")
-            else:
-                print(f"\n{YE}Inject ke:{R}")
-                for pkg in pkgs:
-                    ok, injected = inject_autoexec(pkg, script)
-                    status = f"{GR}✓ {len(injected)} path{R}" if ok else f"{RE}✗ Gagal{R}"
-                    print(f"  {pkg}: {status}")
-                    if ok and injected:
-                        # Tampilkan beberapa path yang berhasil
-                        for p in injected[:3]:
-                            executor = p.split("/files/")[-1].split("/")[0] if "/files/" in p else "generic"
-                            print(f"    {GY}-> {executor}: {p.split('/')[-1]}{R}")
-                        if len(injected) > 3:
-                            print(f"    {GY}... dan {len(injected)-3} path lainnya{R}")
-                print(f"\n{GR}✓ Inject selesai!{R}")
+            pkgs = cfg.get("packages") or ["com.roblox.client"]
+            print(f"\n{YE}Simpan AutoExecute ke:{R}")
+            for pkg in pkgs:
+                ok, injected = inject_autoexec(pkg, script, cfg.get("autoexec_filename", filename))
+                if ok and injected:
+                    print(f"  {GR}OK{R} {pkg}: {GY}{injected[0]}{R}")
+                else:
+                    print(f"  {RE}Gagal{R} {pkg}")
+            print(f"\n{GR}Selesai.{R}")
 
     elif c == "4":
-        print(f"\n{GY}Delay inject saat ini: {ae_delay} detik{R}")
-        print(f"{GY}Rekomendasi: 20-40 detik (tunggu loading game selesai){R}")
-        print(f"{GY}Untuk Fisch/game loading lama: 30-45 detik{R}")
-        val = inp_text(f"{YE}Masukkan delay (detik): {R}")
-        if val.isdigit():
-            cfg["autoexec_delay"] = int(val)
-            save_cfg(cfg)
-            print(f"\n{GR}✓ Delay diset ke {val} detik{R}")
-        else:
-            print(f"{RE}Harus angka!{R}")
-
-    elif c == "5":
         cfg["autoexec_script"] = ""
         save_cfg(cfg)
-        print(f"\n{YE}AutoExec dihapus.{R}")
+        print(f"\n{YE}AutoExec dihapus dari config.{R}")
 
-    elif c == "6":
+    elif c == "5":
         script = cfg.get("autoexec_script", "")
         if script:
             print(f"\n{GY}Script ({len(script.split(chr(10)))} baris):{R}")
@@ -2249,4 +2249,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -9,7 +9,5 @@
   "auto_low_graphics": true,
   "auto_tap_splash": true,
   "load_delay": 40,
-  "autoexec_script": "",
-  "autoexec_filename": "autoexec.lua",
   "webhook_url": ""
 }

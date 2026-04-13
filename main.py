@@ -236,8 +236,6 @@ def load_cfg():
         "auto_low_graphics": True,
         "auto_tap_splash": True,
         "load_delay": 40,
-        "autoexec_script": "",
-        "autoexec_filename": "autoexec.lua",
         "webhook_url": "",
     }
 
@@ -626,7 +624,7 @@ MENU_ITEMS = [
     ("10",  "Toggle Auto Mute"),
     ("11",  "Toggle Low Grafik"),
     ("12",  "Toggle Auto Tap Splash"),
-    ("13",  "Set AutoExec Script"),
+    ("13",  "Manage AutoExec Files"),
     ("14",  "Diagnostic"),
     ("15",  "Lihat Log"),
     ("16",  "Exit"),
@@ -894,7 +892,6 @@ def _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
 
     pkg          = a["pkg"]
     link         = a["ps_link"]
-    ae_script    = cfg.get("autoexec_script", "")
     auto_tap     = cfg.get("auto_tap_splash", True)
     tap_interval = cfg.get("tap_interval", 3)
     api_fail_limit = max(1, int(cfg.get("api_fail_limit", 3)))
@@ -946,8 +943,6 @@ def _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
         protect_app(pkg)
 
         # Auto tap + inject autoexec sampai in-game
-        injected_ae  = False
-        
         # --- NEW TIMER LOGIC (YURXZ v9.1.5) ---
         # Toggleable via auto_tap_splash (auto_tap variable)
         if auto_tap:
@@ -963,12 +958,6 @@ def _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
                 if t == l_delay or t <= 5 or t % 10 == 0:
                     log(f"{pkg}: Loading... {t}s remaining", "INFO")
 
-                # Tetap injek autoexec di tengah-tengah loading
-                if ae_script and not injected_ae and t <= (l_delay // 2):
-                    a["status"] = "Inject autoexec..."
-                    inject_autoexec(pkg, ae_script, cfg.get("autoexec_filename", "autoexec.lua"))
-                    injected_ae = True
-                    
                 time.sleep(1)
 
             # Final 3s countdown buat tap burst
@@ -980,13 +969,6 @@ def _watch_package_logic(a, cfg, accounts, sw, sh, tot, wh_url,
             log(f"{pkg}: Tapping Skip Burst (3x Center)...", "INFO")
             do_smart_tap("Wait End")
             time.sleep(2)
-        else:
-            # Fast track: Inject AE immediately if timer is off
-            if ae_script and not injected_ae:
-                a["status"] = "Inject autoexec..."
-                inject_autoexec(pkg, ae_script, cfg.get("autoexec_filename", "autoexec.lua"))
-                injected_ae = True
-
         a["status"] = f"Running ✅ (rejoin #{a['rejoin_count']})"
         if wh_url:
             _send_webhook_nocookie(wh_url, accounts,
@@ -1263,14 +1245,6 @@ def menu_start_rejoin():
                 a["status"] = "Set low grafik..."
                 draw_ui(accounts, "Launching", f"[{i+1}/{tot}]")
                 set_low_graphics(pkg)
-            # Inject AutoExec file before launch finishes so the executor can pick it up.
-            ae_script = cfg.get("autoexec_script", "")
-            if ae_script:
-                # Inject file dulu sebelum delay (supaya executor baca saat load)
-                a["status"] = "Inject autoexec..."
-                draw_ui(accounts, "Launching", f"[{i+1}/{tot}]")
-                ok_ae, _ = inject_autoexec(pkg, ae_script, cfg.get("autoexec_filename", "autoexec.lua"))
-                log(f"AutoExec pre-inject {'OK' if ok_ae else 'GAGAL'} untuk {pkg}", "INFO")
             time.sleep(3)
             protect_app(pkg)
             log(f"Launch awal {pkg} → OK", "INFO")
@@ -1584,7 +1558,6 @@ def menu_clear_config():
                   "restart_delay":10,"floating_window":True,
                   "auto_mute":True,"auto_low_graphics":True,
                   "auto_tap_splash":True,"load_delay":40,
-                  "autoexec_script":"","autoexec_filename":"autoexec.lua",
                   "webhook_url":""})
         print(f"{GR}✓ Config direset total.{R}")
     else:
@@ -1597,7 +1570,6 @@ def menu_clear_config():
 def menu_list_config():
     cfg  = load_cfg()
     pkgs = cfg.get("packages", [])
-    ae   = cfg.get("autoexec_script", "")
     wh   = cfg.get("webhook_url", "")
 
     def yn(key, default=True):
@@ -1656,7 +1628,6 @@ def menu_list_config():
         ("Mute",     yn("auto_mute")),
         ("LowGfx",   yn("auto_low_graphics")),
         ("AutoTap",  yn("auto_tap_splash")),
-        ("AutoExec", f"{GR}Ada{R}" if ae else f"{GY}Kosong{R}"),
         ("Webhook",  f"{GR}Ada{R}" if wh else f"{GY}Kosong{R}"),
     ]
 
@@ -1735,7 +1706,7 @@ def menu_toggle(key, label):
 # ==========================================================
 #  MENU 12 — LIHAT LOG
 # ==========================================================
-def normalize_lua_filename(name, default="autoexec.lua"):
+def normalize_lua_filename(name, default="script.lua"):
     name = (name or default).strip().split("/")[-1].split("\\")[-1]
     if not name:
         name = default
@@ -1743,73 +1714,62 @@ def normalize_lua_filename(name, default="autoexec.lua"):
         name += ".lua"
     return name
 
-def inject_autoexec(pkg, script, filename="autoexec.lua"):
-    """
-    Save AutoExec Lua to the same detected folder used by the Discord button.
-    Priority:
-    1. /storage/emulated/0/Android/data/<pkg>/files/gloop/external/Autoexecute
-    2. /storage/emulated/0/Delta/Autoexecute
-    If neither exists, create the package gloop path.
-    """
-    candidates = [
+def autoexec_candidates(pkg):
+    return [
         f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Autoexecute",
         "/storage/emulated/0/Delta/Autoexecute",
     ]
-    folder = None
+
+def detect_autoexec_folder(pkg):
+    candidates = autoexec_candidates(pkg)
     for candidate in candidates:
         ok, _ = run_root(f"test -d '{candidate}' 2>/dev/null")
         if ok:
-            folder = candidate
-            break
+            return candidate
+    return candidates[0]
 
-    folder = folder or candidates[0]
+def save_autoexec_file(pkg, filename, script):
+    folder = detect_autoexec_folder(pkg)
     filename = normalize_lua_filename(filename)
     path = f"{folder}/{filename}"
     escaped = script.replace("'", "'\\''")
-
     run_root(f"mkdir -p '{folder}' 2>/dev/null")
     ok, out = run_root(f"printf '%s' '{escaped}' > '{path}' && chmod 666 '{path}'")
     if ok:
-        log(f"AutoExec OK: {path}", "INFO")
-        return True, [path]
+        log(f"AutoExec saved: {path}", "INFO")
+        return True, path
+    log(f"AutoExec save gagal untuk {pkg}: {out}", "WARN")
+    return False, out
 
-    log(f"AutoExec gagal untuk {pkg}: {out}", "WARN")
-    return False, []
+def list_autoexec_files(pkg):
+    paths = []
+    for folder in autoexec_candidates(pkg):
+        ok, out = run_root(f"ls -1 '{folder}'/*.lua 2>/dev/null")
+        if ok and out.strip():
+            paths += [line.strip() for line in out.splitlines() if line.strip()]
+    return list(dict.fromkeys(paths))
 
 def menu_autoexec():
     cfg = load_cfg()
-    current = cfg.get("autoexec_script", "")
-    filename = normalize_lua_filename(cfg.get("autoexec_filename", "autoexec.lua"))
+    pkgs = cfg.get("packages") or ["com.roblox.client"]
+    default_pkg = pkgs[0]
 
-    print(f"\n{CY}[ Set AutoExec Script ]{R}")
+    print(f"\n{CY}[ AutoExec Files ]{R}")
     print(f"{GY}{'-'*get_term_width()}{R}")
-
-    if current:
-        preview = current[:80] + "..." if len(current) > 80 else current
-        print(f"{GY}Script: {preview}{R}")
-    else:
-        print(f"{GY}Script: (belum ada){R}")
-    print(f"{GY}Nama file: {filename}{R}")
-    print(f"{GY}AutoExec akan disimpan ke folder yang terdeteksi:{R}")
-    print(f"{GY}- /storage/emulated/0/Android/data/<pkg>/files/gloop/external/Autoexecute{R}")
-    print(f"{GY}- /storage/emulated/0/Delta/Autoexecute{R}")
+    print(f"{GY}AutoExec dikelola sebagai file .lua di folder executor.{R}")
+    print(f"{GY}Default package: {default_pkg}{R}")
     print()
-
-    print(f"  {YE}1{R}. Input script baru")
-    print(f"  {YE}2{R}. Load dari file Lua")
-    print(f"  {YE}3{R}. Simpan ke folder AutoExecute sekarang")
-    print(f"  {YE}4{R}. Hapus AutoExec dari config")
-    print(f"  {YE}5{R}. Lihat script saat ini")
-    print(f"  {YE}6{R}. Batal")
+    print(f"  {YE}1{R}. Tambah script baru")
+    print(f"  {YE}2{R}. Load script dari file")
+    print(f"  {YE}3{R}. List script AutoExecute")
+    print(f"  {YE}4{R}. Hapus script AutoExecute")
+    print(f"  {YE}5{R}. Batal")
     print(f"{GY}{'-'*get_term_width()}{R}")
 
     c = inp(f"{YE}Pilih: {R}")
 
     if c == "1":
-        name = inp_text(f"{YE}Nama file script [.lua] [{filename}]: {R}").strip()
-        if name:
-            filename = normalize_lua_filename(name)
-            cfg["autoexec_filename"] = filename
+        filename = normalize_lua_filename(inp_text(f"{YE}Nama file script [.lua]: {R}"))
         print(f"\n{GY}Paste script Lua kamu.")
         print(f"Ketik END di baris baru untuk selesai:{R}")
         lines = []
@@ -1822,57 +1782,54 @@ def menu_autoexec():
             except EOFError:
                 break
         script = "\n".join(lines).strip()
-        if script:
-            cfg["autoexec_script"] = script
-            cfg["autoexec_filename"] = filename
-            save_cfg(cfg)
-            print(f"\n{GR}Script disimpan ke config. Pilih menu 3 untuk tulis ke folder AutoExecute.{R}")
-        else:
+        if not script:
             print(f"{RE}Script kosong!{R}")
+        else:
+            for pkg in pkgs:
+                ok, res = save_autoexec_file(pkg, filename, script)
+                print(f"  {pkg}: {GR if ok else RE}{'OK' if ok else 'Gagal'}{R} {res}")
 
     elif c == "2":
-        source_path = inp_text(f"{YE}Path file Lua [/sdcard/Download/{filename}]: {R}").strip()
+        source_path = inp_text(f"{YE}Path file Lua: {R}").strip()
         if not source_path:
-            source_path = f"/sdcard/Download/{filename}"
-        ok, out = run_root(f"cat '{source_path}' 2>/dev/null")
-        if ok and out.strip():
-            cfg["autoexec_script"] = out.strip()
-            cfg["autoexec_filename"] = normalize_lua_filename(source_path)
-            save_cfg(cfg)
-            lines = out.strip().split('\n')
-            print(f"\n{GR}Script dimuat dari {source_path}! ({len(lines)} baris){R}")
-            print(f"{GY}Pilih menu 3 untuk tulis ke folder AutoExecute.{R}")
+            print(f"{RE}Path kosong!{R}")
         else:
-            print(f"{RE}File tidak ditemukan atau kosong!{R}")
-            print(f"{GY}Buat file: /sdcard/Download/{filename}{R}")
+            ok, out = run_root(f"cat '{source_path}' 2>/dev/null")
+            if ok and out.strip():
+                filename = normalize_lua_filename(source_path)
+                for pkg in pkgs:
+                    ok2, res = save_autoexec_file(pkg, filename, out.strip())
+                    print(f"  {pkg}: {GR if ok2 else RE}{'OK' if ok2 else 'Gagal'}{R} {res}")
+            else:
+                print(f"{RE}File tidak ditemukan atau kosong!{R}")
 
     elif c == "3":
-        script = cfg.get("autoexec_script", "")
-        if not script:
-            print(f"{RE}Belum ada script! Set dulu dengan pilihan 1 atau 2.{R}")
-        else:
-            pkgs = cfg.get("packages") or ["com.roblox.client"]
-            print(f"\n{YE}Simpan AutoExecute ke:{R}")
-            for pkg in pkgs:
-                ok, injected = inject_autoexec(pkg, script, cfg.get("autoexec_filename", filename))
-                if ok and injected:
-                    print(f"  {GR}OK{R} {pkg}: {GY}{injected[0]}{R}")
-                else:
-                    print(f"  {RE}Gagal{R} {pkg}")
-            print(f"\n{GR}Selesai.{R}")
+        for pkg in pkgs:
+            print(f"\n{YE}{pkg}{R}")
+            files = list_autoexec_files(pkg)
+            if files:
+                for f in files:
+                    print(f"  {GY}{f}{R}")
+            else:
+                print(f"  {GY}(kosong){R}")
 
     elif c == "4":
-        cfg["autoexec_script"] = ""
-        save_cfg(cfg)
-        print(f"\n{YE}AutoExec dihapus dari config.{R}")
-
-    elif c == "5":
-        script = cfg.get("autoexec_script", "")
-        if script:
-            print(f"\n{GY}Script ({len(script.split(chr(10)))} baris):{R}")
-            print(f"{WH}{script}{R}")
+        all_files = []
+        for pkg in pkgs:
+            all_files.extend(list_autoexec_files(pkg))
+        all_files = list(dict.fromkeys(all_files))
+        if not all_files:
+            print(f"{YE}Tidak ada script AutoExecute.{R}")
         else:
-            print(f"{YE}Belum ada script.{R}")
+            for i, f in enumerate(all_files, 1):
+                print(f"  {YE}{i}{R}. {f}")
+            val = inp_text(f"{YE}Nomor yang dihapus: {R}").strip()
+            if val.isdigit() and 1 <= int(val) <= len(all_files):
+                target = all_files[int(val) - 1]
+                ok, out = run_root(f"rm '{target}'")
+                print(f"{GR}Dihapus: {target}{R}" if ok else f"{RE}Gagal hapus: {out}{R}")
+            else:
+                print(f"{YE}Dibatalkan.{R}")
 
     else:
         print(f"{YE}Dibatalkan.{R}")

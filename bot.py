@@ -453,41 +453,6 @@ def stop_rejoin():
         return False, "Tools tidak sedang jalan!"
     return stop_tools()
 
-def run_lua_script(script_text, pkg=None):
-    """Inject script Lua ke executor."""
-    cfg  = load_main_cfg()
-    pkgs = [pkg] if pkg else cfg.get("packages", [])
-    if not pkgs:
-        pkgs = ["com.roblox.client"]
-
-    filename = (cfg.get("autoexec_filename") or "autoexec.lua").strip().split("/")[-1].split("\\")[-1]
-    if not filename.endswith(".lua"):
-        filename += ".lua"
-
-    results = []
-    for p in pkgs:
-        escaped     = script_text.replace("'", "'\\''")
-
-        candidates = [
-            f"/storage/emulated/0/Android/data/{p}/files/gloop/external/Autoexecute",
-            "/storage/emulated/0/Delta/Autoexecute",
-        ]
-        folder = None
-        for candidate in candidates:
-            r = subprocess.run(["su", "-c", f"test -d '{candidate}'"], capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
-                folder = candidate
-                break
-        folder = folder or candidates[0]
-        path = f"{folder}/{filename}"
-        r = subprocess.run(
-            ["su", "-c", f"mkdir -p '{folder}' && printf '%s' '{escaped}' > '{path}' && chmod 666 '{path}'"],
-            capture_output=True, text=True, timeout=10
-        )
-        results.append(f"{p}: {'OK' if r.returncode == 0 else 'Gagal'} {path}")
-
-    return True, "\n".join(results)
-
 def find_installed_pkgs():
     """Scan SEMUA package di device secara dinamis (seperti main.py)."""
     installed = []
@@ -788,12 +753,6 @@ class DiscordBot:
                 "components": [
                     {
                         "type": 2,
-                        "label": "💉 Run Script",
-                        "style": 1,
-                        "custom_id": "btn_script",
-                    },
-                    {
-                        "type": 2,
                         "label": "🔗 Set PS Link",
                         "style": 1,
                         "custom_id": "btn_set_ps",
@@ -1034,7 +993,6 @@ class DiscordBot:
             mute     = cfg.get("auto_mute", True)
             lowgfx   = cfg.get("auto_low_graphics", True)
             auto_tap = cfg.get("auto_tap_splash", True)
-            ae_script= cfg.get("autoexec_script", "")
 
             on  = "✅ ON"
             off = "❌ OFF"
@@ -1059,7 +1017,7 @@ class DiscordBot:
                 f"**Low Grafik:** {on if lowgfx else off}",
                 f"**Auto Tap Splash:** {on if auto_tap else off}",
                 "",
-                f"**AutoExec Script:** {'Ada ✅' if ae_script else 'Kosong ❌'}",
+                f"**AutoExec:** File .lua di folder AutoExecute",
             ]
             embed = {
                 "title": "⚙️ Config Saat Ini",
@@ -1252,27 +1210,6 @@ class DiscordBot:
                 self.respond_interaction(interaction_id, interaction_token,
                     content=f"❌ **Gagal menghapus script:**\n`{r.stderr or r.stdout}`", ephemeral=True)
 
-        elif custom_id == "btn_script":
-            self.respond_modal(
-                interaction_id, interaction_token,
-                "modal_run_script", "Run Lua Script",
-                [
-                    {
-                        "type": 1,
-                        "components": [
-                            {
-                                "type": 4,
-                                "custom_id": "script_code",
-                                "label": "Kode Lua",
-                                "style": 2, # Text Area
-                                "placeholder": "print('hello')",
-                                "required": True
-                            }
-                        ]
-                    }
-                ]
-            )
-
         elif custom_id == "btn_add_autoexec":
             self.respond_modal(
                 interaction_id, interaction_token,
@@ -1363,10 +1300,6 @@ class DiscordBot:
                     cmd = f"mkdir -p '{folder_path}' && printf '%s' '{escaped}' > '{path}' && chmod 666 '{path}'"
                     r = subprocess.run(["su", "-c", cmd], capture_output=True, text=True, timeout=10)
                     if r.returncode == 0:
-                        cfg["autoexec_script"] = content
-                        cfg["autoexec_filename"] = name
-                        with open(str(CONFIG_FILE), "w") as f:
-                            json.dump(cfg, f, indent=2)
                         self.respond_interaction(interaction_id, interaction_token,
                             content=f"AutoExecute saved!\nPath: `{path}`", ephemeral=True)
                     else:
@@ -1451,32 +1384,16 @@ class DiscordBot:
                 self.respond_interaction(interaction_id, interaction_token,
                     content=f"❌ Error updating config: {e}", ephemeral=True)
 
-        elif custom_id == "modal_run_script":
-            script = values.get("script_code")
-            if script:
-                try:
-                    self.respond_interaction(interaction_id, interaction_token,
-                        content="💉 Menjalankan script...", ephemeral=True)
-                except: pass
-                ok, msg = run_lua_script(script)
-                self.edit_interaction_response(interaction_token, content=f"💉 {'✅' if ok else '❌'} Inject script:\n```\n{msg}\n```")
 
     def handle_message(self, data):
-        """Handle pesan !script."""
+        """Handle text commands."""
         content   = data.get("content", "")
         author_id = data.get("author", {}).get("id", "")
 
         if self.owner_ids and author_id not in self.owner_ids:
             return
 
-        if content.startswith("!script "):
-            script_text = content[8:].strip()
-            if script_text:
-                ok, msg = run_lua_script(script_text)
-                icon = "✅" if ok else "❌"
-                self.send_message(content=f"💉 {icon} Inject script:\n```\n{msg}\n```")
-
-        elif content.startswith("!ps "):
+        if content.startswith("!ps "):
             args = content[4:].strip().split(None, 1)
             cfg  = load_main_cfg()
             
